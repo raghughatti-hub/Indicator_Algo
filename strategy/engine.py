@@ -42,11 +42,17 @@ def normalize_bars(bars: list[dict] | pd.DataFrame) -> pd.DataFrame:
     if "volume" not in df.columns:
         df["volume"] = 0
         
-    df["time"] = pd.to_datetime(df["time"])
+    from utils.clock import market_time
+    df["time"] = pd.to_datetime([market_time(t) for t in df["time"]])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
         
-    df = df.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time").reset_index(drop=True)
+    values = df[["open", "high", "low", "close", "volume"]]
+    if not np.isfinite(values.to_numpy(dtype=float)).all():
+        raise ValueError("OHLCV values must be finite numbers")
+    if (df["low"] > df[["open", "close"]].min(axis=1)).any() or (df["high"] < df[["open", "close"]].max(axis=1)).any() or (df["volume"] < 0).any():
+        raise ValueError("Invalid OHLC range or negative volume")
+    df = df.sort_values("time").drop_duplicates("time", keep="last").reset_index(drop=True)
     return df
 
 
@@ -77,68 +83,47 @@ def _status(state: TradeState) -> str:
 # ==============================================================================
 
 def _update_trade(state: TradeState, row: pd.Series, cfg: StrategyConfig, opposite: bool) -> None:
-    """Monitor target price triggers and update Trailing Stop-Loss thresholds for open positions."""
+    """Conservative OHLC execution: the pre-bar stop wins ambiguous candles.
+
+    A trailing level calculated from this bar is effective on the next bar.
+    """
     sig = state.signal
-    is_ce = sig.option_type == "CE"
+    direction = 1 if sig.option_type == "CE" else -1
+    old_stop = max(sig.stop_loss, sig.tsl) if direction == 1 else min(sig.stop_loss, sig.tsl)
+    stop_hit = row.low <= old_stop if direction == 1 else row.high >= old_stop
+    target_hit = row.high >= sig.tp3 if direction == 1 else row.low <= sig.tp3
+    exit_price = float(row.close)
+    reason = None
+    if stop_hit:
+        opening = float(row.get("open", old_stop))
+        exit_price = min(opening, old_stop) if direction == 1 else max(opening, old_stop)
+        reason = "TSL" if old_stop != sig.stop_loss else "SL"
+        state.sl_hit = reason == "SL"
+    elif target_hit:
+        exit_price = sig.tp3
+        reason = "TP3"
+        state.tp3_hit = True
+    elif opposite:
+        reason = "OPPOSITE"
 
-    # 1. Evaluate immediate price touch triggers
-    sl_now = row.low <= sig.stop_loss if is_ce else row.high >= sig.stop_loss
-    tp1_now = row.high >= sig.tp1 if is_ce else row.low <= sig.tp1
-    tp2_now = row.high >= sig.tp2 if is_ce else row.low <= sig.tp2
-    tp3_now = row.high >= sig.tp3 if is_ce else row.low <= sig.tp3
-
-    state.sl_hit = state.sl_hit or sl_now
-    state.tp1_hit = state.tp1_hit or tp1_now
-    state.tp2_hit = state.tp2_hit or tp2_now
-    state.tp3_hit = state.tp3_hit or tp3_now
-
-    # 2. Adjust Trailing Stop-Loss (TSL) steps
-    if state.tp1_hit and sig.tsl == sig.stop_loss:
-        sig.tsl = sig.entry
-    if state.tp2_hit and ((is_ce and sig.tsl < sig.tp1) or (not is_ce and sig.tsl > sig.tp1)):
-        sig.tsl = sig.tp1
-    if state.tp3_hit and cfg.tsl_tp3_to_tp2:
-        sig.tsl = sig.tp2
-
-    # 3. Dynamic points extension beyond Target 3
-    points_beyond = row.close - sig.tp3 if is_ce else sig.tp3 - row.close
-    if points_beyond >= cfg.tsl_points_to_tp3:
-        sig.tsl = sig.tp3
-    if cfg.tsl_1to1_increment and points_beyond > cfg.tsl_points_to_tp3:
-        trail = sig.tp3 + (points_beyond - cfg.tsl_points_to_tp3) * (1 if is_ce else -1)
-        sig.tsl = max(sig.tsl, trail) if is_ce else min(sig.tsl, trail)
-
-    # 4. Compile closure state and status labels
-    tsl_hit = row.low <= sig.tsl if is_ce else row.high >= sig.tsl
-    should_exit = sl_now or tp3_now or tsl_hit or opposite
-
-    # Calculate live PnL based on current close or specific trigger exit price
-    if should_exit:
-        if tsl_hit:
-            exit_price = sig.tsl
-        elif sl_now:
-            exit_price = sig.stop_loss
-        elif tp3_now:
-            exit_price = sig.tp3
-        else:
-            exit_price = row.close
-    else:
-        exit_price = row.close
-
-    live_pnl = ((exit_price - sig.entry) if is_ce else (sig.entry - exit_price)) * cfg.delta_proxy
-    sig.pnl = float(live_pnl)
-    sig.status = _status(state)
-    
-    if should_exit:
+    if reason:
         state.closed = True
-        if tsl_hit:
-            sig.status = f"{sig.status}_TSL" if sig.status != "OPEN" else "TSL"
-        elif opposite:
-            sig.status = f"{sig.status}_OPP" if sig.status != "OPEN" else "OPPOSITE"
-        elif sl_now:
-            sig.status = "SL"
-        elif tp3_now:
-            sig.status = "TP3"
+        sig.closed = True
+        sig.exit_reason = reason
+        sig.exit_time = row.time.to_pydatetime() if hasattr(row.time, "to_pydatetime") else row.time
+        sig.status = reason
+    else:
+        state.tp1_hit |= bool(row.high >= sig.tp1 if direction == 1 else row.low <= sig.tp1)
+        state.tp2_hit |= bool(row.high >= sig.tp2 if direction == 1 else row.low <= sig.tp2)
+        next_stop = sig.tsl
+        if state.tp1_hit:
+            next_stop = max(next_stop, sig.entry) if direction == 1 else min(next_stop, sig.entry)
+        if state.tp2_hit:
+            next_stop = max(next_stop, sig.tp1) if direction == 1 else min(next_stop, sig.tp1)
+        # TP3 exits the trade, so extension beyond TP3 does not alter this lifecycle.
+        sig.tsl = next_stop
+        sig.status = _status(state)
+    sig.pnl = float((exit_price - sig.entry) * direction * cfg.delta_proxy)
 
 
 # ==============================================================================
@@ -153,44 +138,7 @@ def run_strategy(bars: list[dict] | pd.DataFrame, cfg: StrategyConfig | None = N
     if len(df) == 0:
         raise ValueError("No historical candles available. Check connection, symbol, or trading segment.")
     
-    # Auto-pad the dataframe by prepending dummy flat candles if there are fewer than 450 candles.
-    # The strategy calculates ATR(200) smoothed by SMA(200), which requires a combined 400 periods
-    # of warmup data to yield non-NaN indicator values for active trade signals.
-    required = max(450, cfg.ss_length * 2)
-    if len(df) < required:
-        pad_count = required - len(df) + 10
-        first_row = df.iloc[0]
-        t0 = first_row["time"]
-        if isinstance(t0, str):
-            t0 = pd.to_datetime(t0)
-            
-        # Estimate timeframe interval delta
-        if len(df) > 1:
-            t1 = df.iloc[1]["time"]
-            if isinstance(t1, str):
-                t1 = pd.to_datetime(t1)
-            interval_delta = t1 - t0
-        else:
-            interval_delta = pd.Timedelta(minutes=5)
-            
-        pad_rows = []
-        for i in range(pad_count, 0, -1):
-            pad_time = t0 - (interval_delta * i)
-            pad_rows.append({
-                "time": pad_time,
-                "open": float(first_row["open"]),
-                "high": float(first_row["high"]),
-                "low": float(first_row["low"]),
-                "close": float(first_row["close"]),
-                "volume": 0.0,
-            })
-        pad_df = pd.DataFrame(pad_rows)
-        # Ensure column types and structure align
-        for col in df.columns:
-            if col not in pad_df.columns:
-                pad_df[col] = df[col].iloc[0]
-        pad_df = pad_df[df.columns]
-        df = pd.concat([pad_df, df], ignore_index=True)
+    required = max(399, cfg.ss_length, cfg.vol_length, 2 * cfg.adx_length if cfg.use_adx_filter else 1, cfg.st_atr_len if cfg.use_supertrend_filter else 1)
 
     # 1. Calculate Technical Indicators (ATR, SMA, DMI/ADX, VWAP, Supertrend)
     df["atr_200"] = atr(df, 200)
@@ -244,7 +192,8 @@ def run_strategy(bars: list[dict] | pd.DataFrame, cfg: StrategyConfig | None = N
             if candles_since < cfg.entry_lookback:
                 direction_valid = trend if pending_dir == DIR_BUY else not trend
                 adx_ok = (not cfg.use_adx_filter) or row.adx > cfg.adx_threshold
-                if direction_valid and adx_ok:
+                st_ok = (not cfg.use_supertrend_filter) or (not pd.isna(row.supertrend) and (row.st_direction == (1 if pending_dir == DIR_BUY else -1)))
+                if direction_valid and adx_ok and st_ok:
                     signal_up = pending_dir == DIR_BUY
                     signal_down = pending_dir == DIR_SELL
                     pending_dir = DIR_NONE
@@ -299,6 +248,9 @@ def run_strategy(bars: list[dict] | pd.DataFrame, cfg: StrategyConfig | None = N
     return {
         "summary": {
             "bars": len(df),
+            "warmup_required": required,
+            "warmup_complete": len(df) >= required,
+            "pnl_basis": "underlying points times delta_proxy; excludes fills, costs and option pricing",
             "buy_count": buy_count,
             "sell_count": sell_count,
             "last_close": float(last.close),

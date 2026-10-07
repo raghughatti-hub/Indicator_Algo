@@ -1,6 +1,9 @@
 from functools import lru_cache
 from pathlib import Path
 import os
+import json
+import tempfile
+import threading
 
 from pydantic import BaseModel
 
@@ -31,16 +34,22 @@ def _parse_key_value_file(path: Path) -> dict[str, str]:
     return parsed
 
 
-def _load_dotenv() -> None:
-    env_path = BASE_DIR / ".env"
-    if not env_path.exists():
-        return
-    for raw in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        os.environ[key.strip()] = value.strip().strip('"').strip("'")
+def _load_dotenv() -> dict[str, str]:
+    """Read local fallback values; never override process-injected configuration."""
+    from dotenv import dotenv_values
+    return {k:v for k,v in dotenv_values(BASE_DIR / ".env").items() if v is not None}
+
+
+_token_lock = threading.RLock()
+
+
+def _session_tokens() -> dict[str, str]:
+    from utils.security import runtime_dir
+    path = runtime_dir() / "session_tokens.json"
+    if not path.exists():
+        return {}
+    with _token_lock:
+        return json.loads(path.read_text())
 
 
 class Settings(BaseModel):
@@ -85,10 +94,13 @@ class Settings(BaseModel):
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    _load_dotenv()
+    dotenv = _load_dotenv()
+    tokens = _session_tokens()
+    def setting(name,default=""):
+        return os.environ.get(name,tokens.get(name,dotenv.get(name,default)))
     
     # Read active broker from env (fallback to zebu)
-    active = os.getenv("ACTIVE_BROKER", "zebu").lower()
+    active = setting("ACTIVE_BROKER", "zebu").lower()
     
     # Load Zebu creds from app/zebu/creds.txt or root creds.txt
     zebu_path = BASE_DIR / "app" / "zebu" / "creds.txt"
@@ -116,40 +128,40 @@ def get_settings() -> Settings:
         active_broker=active,
         
         # Zebu
-        zebu_client_id=os.getenv("ZEBU_CLIENT_ID", "") or zebu_txt.get("client_id", ""),
-        zebu_api_secret=os.getenv("ZEBU_API_SECRET", "") or zebu_txt.get("api_secret", ""),
-        zebu_user_id=os.getenv("ZEBU_USER_ID", "") or zebu_txt.get("vendor_code", ""),
-        zebu_password=os.getenv("ZEBU_PASSWORD", "") or zebu_txt.get("password", ""),
-        zebu_totp_secret=os.getenv("ZEBU_TOTP_SECRET", "") or zebu_txt.get("totp", "") or zebu_txt.get("totp_", ""),
-        zebu_redirect_url=os.getenv("ZEBU_REDIRECT_URL", "") or zebu_txt.get("redirecturl", ""),
-        zebu_access_token=os.getenv("ZEBU_ACCESS_TOKEN", ""),
+        zebu_client_id=setting("ZEBU_CLIENT_ID", "") or zebu_txt.get("client_id", ""),
+        zebu_api_secret=setting("ZEBU_API_SECRET", "") or zebu_txt.get("api_secret", ""),
+        zebu_user_id=setting("ZEBU_USER_ID", "") or zebu_txt.get("vendor_code", ""),
+        zebu_password=setting("ZEBU_PASSWORD", "") or zebu_txt.get("password", ""),
+        zebu_totp_secret=setting("ZEBU_TOTP_SECRET", "") or zebu_txt.get("totp", "") or zebu_txt.get("totp_", ""),
+        zebu_redirect_url=setting("ZEBU_REDIRECT_URL", "") or zebu_txt.get("redirecturl", ""),
+        zebu_access_token=setting("ZEBU_ACCESS_TOKEN", ""),
         
         # FlatTrade
-        flattrade_user_id=os.getenv("FLATTRADE_USER_ID", "") or flattrade_txt.get("vendor_code", ""),
-        flattrade_password=os.getenv("FLATTRADE_PASSWORD", "") or flattrade_txt.get("password", ""),
-        flattrade_totp_secret=os.getenv("FLATTRADE_TOTP_SECRET", "") or flattrade_txt.get("totp", "") or flattrade_txt.get("totp_", ""),
-        flattrade_api_key=os.getenv("FLATTRADE_API_KEY", "") or flattrade_txt.get("api_key", ""),
-        flattrade_api_secret=os.getenv("FLATTRADE_API_SECRET", "") or flattrade_txt.get("api_secret", ""),
-        flattrade_redirect_url=os.getenv("FLATTRADE_REDIRECT_URL", "") or flattrade_txt.get("redirecturl", ""),
-        flattrade_access_token=os.getenv("FLATTRADE_ACCESS_TOKEN", ""),
-        flattrade_suser_token=os.getenv("FLATTRADE_SUSER_TOKEN", ""),
+        flattrade_user_id=setting("FLATTRADE_USER_ID", "") or flattrade_txt.get("vendor_code", ""),
+        flattrade_password=setting("FLATTRADE_PASSWORD", "") or flattrade_txt.get("password", ""),
+        flattrade_totp_secret=setting("FLATTRADE_TOTP_SECRET", "") or flattrade_txt.get("totp", "") or flattrade_txt.get("totp_", ""),
+        flattrade_api_key=setting("FLATTRADE_API_KEY", "") or flattrade_txt.get("api_key", ""),
+        flattrade_api_secret=setting("FLATTRADE_API_SECRET", "") or flattrade_txt.get("api_secret", ""),
+        flattrade_redirect_url=setting("FLATTRADE_REDIRECT_URL", "") or flattrade_txt.get("redirecturl", ""),
+        flattrade_access_token=setting("FLATTRADE_ACCESS_TOKEN", ""),
+        flattrade_suser_token=setting("FLATTRADE_SUSER_TOKEN", ""),
 
         # Upstox
-        upstox_user_id=os.getenv("UPSTOX_USER_ID", "") or upstox_txt.get("user_code", ""),
-        upstox_password=os.getenv("UPSTOX_PASSWORD", "") or upstox_txt.get("password", ""),
-        upstox_pin=os.getenv("UPSTOX_PIN", "") or upstox_txt.get("pin", ""),
-        upstox_api_key=os.getenv("UPSTOX_API_KEY", "") or upstox_txt.get("api_key", ""),
-        upstox_api_secret=os.getenv("UPSTOX_API_SECRET", "") or upstox_txt.get("api_secret", ""),
-        upstox_totp_secret=os.getenv("UPSTOX_TOTP_SECRET", "") or upstox_txt.get("totp", ""),
-        upstox_redirect_url=os.getenv("UPSTOX_REDIRECT_URL", "") or upstox_txt.get("redirect_url", ""),
-        upstox_mobile=os.getenv("UPSTOX_MOBILE", "") or upstox_txt.get("mobile", ""),
-        upstox_access_token=os.getenv("UPSTOX_ACCESS_TOKEN", ""),
+        upstox_user_id=setting("UPSTOX_USER_ID", "") or upstox_txt.get("user_code", ""),
+        upstox_password=setting("UPSTOX_PASSWORD", "") or upstox_txt.get("password", ""),
+        upstox_pin=setting("UPSTOX_PIN", "") or upstox_txt.get("pin", ""),
+        upstox_api_key=setting("UPSTOX_API_KEY", "") or upstox_txt.get("api_key", ""),
+        upstox_api_secret=setting("UPSTOX_API_SECRET", "") or upstox_txt.get("api_secret", ""),
+        upstox_totp_secret=setting("UPSTOX_TOTP_SECRET", "") or upstox_txt.get("totp", ""),
+        upstox_redirect_url=setting("UPSTOX_REDIRECT_URL", "") or upstox_txt.get("redirect_url", ""),
+        upstox_mobile=setting("UPSTOX_MOBILE", "") or upstox_txt.get("mobile", ""),
+        upstox_access_token=setting("UPSTOX_ACCESS_TOKEN", ""),
         
         # General Settings
-        live_trading_enabled=os.getenv("LIVE_TRADING_ENABLED", "false").lower() == "true",
-        default_product_type=os.getenv("DEFAULT_PRODUCT_TYPE", "M"),
-        default_exchange=os.getenv("DEFAULT_EXCHANGE", "NSE"),
-        default_quantity=int(os.getenv("DEFAULT_QUANTITY", "1")),
+        live_trading_enabled=setting("LIVE_TRADING_ENABLED", "false").lower() == "true",
+        default_product_type=setting("DEFAULT_PRODUCT_TYPE", "M"),
+        default_exchange=setting("DEFAULT_EXCHANGE", "NSE"),
+        default_quantity=int(setting("DEFAULT_QUANTITY", "1")),
         creds_txt_loaded=creds_txt_loaded,
     )
 
@@ -160,38 +172,28 @@ def reload_settings() -> Settings:
 
 
 def save_token_to_env(token: str = "", broker: str = "zebu", suser_token: str = "") -> None:
-    """Write or update session tokens and ACTIVE_BROKER in local .env file."""
-    env_path = BASE_DIR / ".env"
-    
-    # Decide which keys to write
-    updates = {"ACTIVE_BROKER": broker}
+    """Persist sessions atomically in ignored runtime storage, not credential files."""
+    from utils.security import runtime_dir
+    updates = {"ACTIVE_BROKER":broker}
     if token:
-        if broker == "zebu":
-            updates["ZEBU_ACCESS_TOKEN"] = token
-        elif broker == "flattrade":
-            updates["FLATTRADE_ACCESS_TOKEN"] = token
+        updates[f"{broker.upper()}_ACCESS_TOKEN"] = token
+        if broker == "flattrade":
             updates["FLATTRADE_SUSER_TOKEN"] = suser_token or token
-        elif broker == "upstox":
-            updates["UPSTOX_ACCESS_TOKEN"] = token
-
-    # Read existing lines
-    lines = []
-    if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-
-    for key, val in updates.items():
-        new_line = f"{key}={val}"
-        updated = False
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith(f"{key}=") or stripped == key:
-                lines[i] = new_line
-                updated = True
-                break
-        if not updated:
-            lines.append(new_line)
-            
-        # Update current environment
-        os.environ[key] = val
-
-    env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with _token_lock:
+        folder = runtime_dir()
+        folder.mkdir(parents=True,exist_ok=True)
+        path = folder / "session_tokens.json"
+        values = _session_tokens()
+        values.update(updates)
+        fd, temporary = tempfile.mkstemp(dir=folder,prefix="session-")
+        try:
+            with os.fdopen(fd,"w") as handle:
+                json.dump(values,handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary,path)
+        except Exception:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+            raise
+        get_settings.cache_clear()

@@ -1,8 +1,0 @@
-User_code	:	2DCYAV
-Static IP	:	49.204.168.42
-API Key		:	f6987757-ad4d-448f-b116-f827e0867a1c
-API Secret	:	cykis8bkq7
-TOTP		:	3M6HOZO4U2TWVTLC6NHNS5CKTG3YSUZM
-Redirect URL	:	http://localhost:8005/upstox/callback
-Pin		:	258247
-Mobile		:	8555947993

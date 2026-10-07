@@ -1,28 +1,28 @@
+from utils.clock import market_now, market_time, candle_start
 from datetime import datetime
 import time
+import secrets
+import hmac
+import threading
 from typing import Any
 import pandas as pd
 
 from config.settings import Settings, BASE_DIR
 from data.instruments import InstrumentMaster
 
-INDEX_TOKENS = {
-    "NIFTY": "26000",
-    "NIFTY50": "26000",
-    "NIFTY50-INDEX": "26000",
-    "BANKNIFTY": "26009",
-    "FINNIFTY": "26037",
-    "MIDCPNIFTY": "26074",
-    "INDIAVIX": "26017",
-    "SENSEX": "1",
-    "BANKEX": "12",
-}
+from config.constants import INDEX_TOKENS
 
 
 class BaseBrokerClient:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.api: Any = None
+        self.order_event = threading.Event()
+        self._order_update_lock = threading.Lock()
+        self._order_updates = {}
+        self._oauth_lock = threading.Lock()
+        self._oauth_state = None
+        self._oauth_deadline = 0.0
         self.connected = False
         self.last_error: str | None = None
         self._session_token: str | None = None  # Persisted session token
@@ -36,8 +36,25 @@ class BaseBrokerClient:
         
         # WebSocket States
         self._ws_quotes: dict[tuple[str, str], dict[str, Any]] = {}
+        self._ws_quote_time: dict[tuple[str, str], float] = {}
+        self.max_quote_age = 3.0
         self._ws_subscribed: set[str] = set()
         self._ws_feed_opened = False
+
+    def publish_order_update(self, update):
+        oid = str(update.get("norenordno") or update.get("order_id") or "")
+        if not oid:
+            return
+        with self._order_update_lock:
+            # Bound memory for unsolicited account-wide order updates.
+            if len(self._order_updates)>=1024 and oid not in self._order_updates:
+                self._order_updates.pop(next(iter(self._order_updates)))
+            self._order_updates[oid]=dict(update)
+        self.order_event.set()
+
+    def take_order_update(self, oid):
+        with self._order_update_lock:
+            return self._order_updates.pop(str(oid),None)
 
     def connect_with_token(self) -> bool:
         raise NotImplementedError()
@@ -45,7 +62,22 @@ class BaseBrokerClient:
     def connect_auto_oauth(self, timeout_seconds: int = 180) -> bool:
         raise NotImplementedError()
 
-    def connect_oauth_code(self, auth_code: str) -> bool:
+    def _begin_oauth(self) -> str:
+        with self._oauth_lock:
+            self._oauth_state = secrets.token_urlsafe(32)
+            self._oauth_deadline = time.monotonic() + 300
+            return self._oauth_state
+
+    def _consume_oauth_state(self, state: str) -> bool:
+        with self._oauth_lock:
+            valid = bool(state and self._oauth_state and time.monotonic() < self._oauth_deadline and hmac.compare_digest(state, self._oauth_state))
+            if valid:
+                self._oauth_state = None
+            else:
+                self.last_error = "OAuth state missing, expired, or invalid; start login again"
+            return valid
+
+    def connect_oauth_code(self, auth_code: str, state: str = "") -> bool:
         raise NotImplementedError()
 
     def status(self) -> dict:
@@ -77,21 +109,8 @@ class BaseBrokerClient:
         return self.instruments.metadata(exchange, symbol, underlying)
 
     def ensure_connected(self) -> None:
-        """Guarantee a live broker session — max 2 attempts, never infinite."""
-        if self.connected:
-            return
-
-        print(f"[AUTH] Connection attempt 1/2 — trying stored token...", flush=True)
-        if self.connect_with_token():
-            return
-
-        print(f"[AUTH] Connection attempt 2/2 — token failed, running OAuth login...", flush=True)
-        if self.connect_auto_oauth():
-            return
-
-        raise RuntimeError(
-            self.last_error or "Connection failed after 2 attempts (token + OAuth). Check credentials."
-        )
+        if not self.connected:
+            raise RuntimeError("Broker disconnected; reconnect explicitly from the login panel")
 
     def close_websocket(self) -> None:
         """Close the WebSocket connection if it is open."""
@@ -188,9 +207,9 @@ class BaseBrokerClient:
         token = self.search_token("INDICES" if clean_exch == "INDICES" else broker_exchange, symbol)
         kwargs: dict[str, Any] = {"exchange": broker_exchange, "token": token, "interval": interval}
         if start:
-            kwargs["starttime"] = int(start.timestamp())
+            kwargs["starttime"] = int(market_time(start).timestamp())
         if end:
-            kwargs["endtime"] = int(end.timestamp())
+            kwargs["endtime"] = int(market_time(end).timestamp())
         
         response = self.api.get_time_price_series(**kwargs)
         if isinstance(response, dict) and response.get("stat") == "Not_Ok":
@@ -214,7 +233,7 @@ class BaseBrokerClient:
                 try:
                     rows.append(
                         {
-                            "time": pd.to_datetime(item.get("time"), dayfirst=True).to_pydatetime(),
+                            "time": market_time(pd.to_datetime(item.get("time"), dayfirst=True).to_pydatetime()),
                             "open": float(item.get("into", 0)),
                             "high": float(item.get("inth", 0)),
                             "low": float(item.get("intl", 0)),
@@ -236,7 +255,7 @@ class BaseBrokerClient:
         if not bypass_cache:
             if self._ws_feed_opened:
                 key = (exchange.upper(), token.strip())
-                if key in self._ws_quotes:
+                if key in self._ws_quotes and time.monotonic()-self._ws_quote_time.get(key,0) <= self.max_quote_age:
                     return self._ws_quotes[key]
                     
             now_ts = time.time()
@@ -269,8 +288,10 @@ class BaseBrokerClient:
 
     @staticmethod
     def quote_ltp(quote: dict) -> float | None:
-        value = quote.get("lp") or quote.get("ltp") or quote.get("c")
-        return float(value) if value is not None else None
+        import math
+        value = quote.get("lp") if quote.get("lp") is not None else quote.get("ltp")
+        value = float(value) if value is not None else None
+        return value if value is not None and math.isfinite(value) and value > 0 else None
 
     @staticmethod
     def _quote_number(quote: dict, keys: tuple[str, ...]) -> float | None:
@@ -288,7 +309,7 @@ class BaseBrokerClient:
         ltp = self.quote_ltp(quote)
         best_buy = self._quote_number(quote, ("bp1", "best_buy", "best_bid", "bid", "b1", "bp"))
         best_sell = self._quote_number(quote, ("sp1", "best_sell", "best_ask", "ask", "a1", "sp"))
-        tick_size = self._quote_number(quote, ("ti", "tick_size", "ticksize", "tick", "pp"))
+        tick_size = self._quote_number(quote, ("ti", "tick_size", "ticksize", "tick"))
         return {
             "raw": quote,
             "ltp": ltp,
@@ -365,7 +386,7 @@ class BaseBrokerClient:
                         "error": str(e),
                     }
                 )
-                quotes.append(fallback)
+                quotes.append(dict(fallback,stale=True,error=str(e)))
         return quotes
 
     def get_single_index_quote(self, name: str) -> dict[str, Any] | None:
@@ -428,7 +449,7 @@ class BaseBrokerClient:
                     "error": str(e),
                 }
             )
-            return fallback
+            return dict(fallback,stale=True,error=str(e))
 
     def resolve_spot(self, exchange: str, underlying: str) -> dict:
         self.ensure_connected()
@@ -437,7 +458,10 @@ class BaseBrokerClient:
         values = response.get("values", []) if isinstance(response, dict) else []
         if not values:
             raise RuntimeError(f"No spot instrument found for {broker_exchange}:{underlying}")
-        selected = values[0]
+        matches=[v for v in values if str(v.get("tsym") or v.get("tradingsymbol") or "").upper() in {underlying.upper(),underlying.upper()+"-EQ"}]
+        if len(matches)!=1:
+            raise RuntimeError("Spot search did not identify one exact instrument")
+        selected = matches[0]
         return {
             "exchange": broker_exchange,
             "tradingsymbol": selected.get("tsym") or selected.get("tradingsymbol") or underlying,
@@ -446,68 +470,16 @@ class BaseBrokerClient:
         }
 
     def resolve_future(self, underlying: str, exchange: str = "NFO", expiry: str = "CURRENT_MONTH") -> dict:
-        contract = self.instruments.resolve_future(underlying, exchange, expiry)
-        if contract:
-            return contract
-        self.ensure_connected()
-        response = self.api.searchscrip(exchange=exchange, searchtext=f"{underlying} FUT")
-        values = response.get("values", []) if isinstance(response, dict) else []
-        if not values:
-            raise RuntimeError(f"No future contract found for {exchange}:{underlying}")
-            
-        selected = None
-        for val in values:
-            tsym = str(val.get("tsym") or val.get("tradingsymbol") or "").upper().strip()
-            if tsym.startswith(underlying.upper()):
-                if underlying.upper() == "NIFTY" and tsym.startswith("NIFTYNXT"):
-                    continue
-                selected = val
-                break
-        if not selected:
-            selected = values[0]
-        return {
-            "exchange": exchange,
-            "tradingsymbol": selected.get("tsym") or selected.get("tradingsymbol") or f"{underlying} FUT",
-            "token": str(selected.get("token")),
-            "raw": selected,
-            "expiry": expiry,
-        }
+        contract = self.instruments.resolve_future(underlying,exchange,expiry)
+        if not contract:
+            raise RuntimeError("Exact future contract unavailable in verified instrument master; refresh instruments")
+        return contract
 
-    def resolve_option(
-        self,
-        underlying: str,
-        strike: int,
-        option_type: str,
-        expiry: str = "CURRENT_WEEK",
-        exchange: str = "NFO",
-    ) -> dict:
-        contract = self.instruments.resolve_option(underlying, strike, option_type, expiry, exchange)
-        if contract:
-            return contract
-        self.ensure_connected()
-        search_text = f"{underlying} {strike} {option_type}"
-        response = self.api.searchscrip(exchange=exchange, searchtext=search_text)
-        values = response.get("values", []) if isinstance(response, dict) else []
-        if not values:
-            raise RuntimeError(f"No option contract found for {exchange}:{search_text}")
-            
-        selected = None
-        for val in values:
-            tsym = str(val.get("tsym") or val.get("tradingsymbol") or "").upper().strip()
-            if tsym.startswith(underlying.upper()):
-                if underlying.upper() == "NIFTY" and tsym.startswith("NIFTYNXT"):
-                    continue
-                selected = val
-                break
-        if not selected:
-            selected = values[0]
-        return {
-            "exchange": exchange,
-            "tradingsymbol": selected.get("tsym") or selected.get("tradingsymbol") or selected.get("dname") or search_text,
-            "token": str(selected.get("token")),
-            "raw": selected,
-            "expiry": expiry,
-        }
+    def resolve_option(self, underlying: str, strike: int, option_type: str, expiry: str = "CURRENT_WEEK", exchange: str = "NFO") -> dict:
+        contract = self.instruments.resolve_option(underlying,strike,option_type,expiry,exchange)
+        if not contract:
+            raise RuntimeError("Exact option contract unavailable in verified instrument master; refresh instruments")
+        return contract
 
     def place_order(
         self,
@@ -521,7 +493,12 @@ class BaseBrokerClient:
         price: float,
         trigger_price: float | None,
         confirm_live: bool,
+        client_order_id: str | None = None,
     ) -> dict:
+        if price_type != "LMT":
+            raise ValueError("Only LIMIT orders are supported for algo execution")
+        if price <= 0 or quantity <= 0:
+            raise ValueError("Limit price and quantity must be positive")
         if not self.settings.live_trading_enabled or not confirm_live:
             return {
                 "paper": True,
@@ -550,7 +527,7 @@ class BaseBrokerClient:
             price=price,
             trigger_price=trigger_price,
             retention="DAY",
-            remarks="nse-tools-python",
+            remarks=client_order_id or "nse-tools-python",
         )
         if response:
             return response

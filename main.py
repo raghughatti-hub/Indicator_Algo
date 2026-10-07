@@ -15,8 +15,8 @@ for stream in (sys.stdout, sys.stderr):
                 pass
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -35,6 +35,8 @@ from models.schemas import (
 )
 from strategy.engine import run_strategy, normalize_bars
 from brokers.base import BaseBrokerClient
+from utils.security import authorized, local_browser, same_origin, control_token, runtime_dir
+from html import escape
 
 # ==============================================================================
 # SECTION 1: IMPORTS & API INITIALIZATION
@@ -43,7 +45,7 @@ from brokers.base import BaseBrokerClient
 app = FastAPI(
     title="NSE Tools Python Algo - Multi-Broker Refactored Edition",
     version="0.2.0",
-    description="Production-grade local API backend for Running Pine-based intraday options automation."
+    description="Local strategy and broker execution dashboard."
 )
 
 settings = get_settings()
@@ -64,12 +66,12 @@ def get_active_client() -> BaseBrokerClient:
             from brokers.zebu.client import ZebuClient
             broker_client = ZebuClient(curr_settings)
         # Bind to runner
-        runner.broker = broker_client
+        runner.attach_broker(broker_client)
     return broker_client
 
 
 # Instantiate runner — broker client is initialized lazily on first request
-runner = IntradayRunner(None)
+runner = IntradayRunner(None,state_path=runtime_dir()/"trading_state.json")
 
 # Mount local static file handler for index, styles, and script
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
@@ -80,9 +82,13 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 # ==============================================================================
 
 @app.get("/", response_class=HTMLResponse)
-def index() -> str:
-    """Serve the main web UI panel page HTML content."""
-    return (BASE_DIR / "static" / "index.html").read_text(encoding="utf-8")
+def index(request: Request) -> HTMLResponse:
+    if not same_origin(request):
+        raise HTTPException(status_code=403,detail="Cross-origin control access denied")
+    response=HTMLResponse((BASE_DIR/"static"/"index.html").read_text(encoding="utf-8"))
+    if local_browser(request):
+        response.set_cookie("algo_session",control_token(),httponly=True,samesite="strict",secure=request.url.scheme=="https")
+    return response
 
 
 # ==============================================================================
@@ -101,6 +107,10 @@ def connect_broker(req: ConnectRequest) -> ApiResponse:
     if broker_name not in ("zebu", "flattrade", "upstox"):
         raise HTTPException(status_code=400, detail=f"Unsupported broker: {broker_name}")
 
+    if runner.has_unsettled_orders():
+        candidate = get_active_client()
+        if broker_name != candidate.settings.active_broker or candidate.connected:
+            raise HTTPException(status_code=409,detail="Settle open/pending trades before changing broker session")
     # Close any existing active connection
     if broker_client:
         try:
@@ -125,13 +135,14 @@ def connect_broker(req: ConnectRequest) -> ApiResponse:
         from brokers.zebu.client import ZebuClient
         broker_client = ZebuClient(curr_settings)
 
-    runner.broker = broker_client
+    runner.attach_broker(broker_client)
 
     # Connect client
     ok = broker_client.connect_with_token()
     if not ok:
         ok = broker_client.connect_auto_oauth()
     if ok:
+        runner.attach_broker(broker_client)
         broker_client.ensure_instruments_daily()
 
     return ApiResponse(
@@ -145,6 +156,8 @@ def connect_broker(req: ConnectRequest) -> ApiResponse:
 def disconnect_broker() -> ApiResponse:
     """Log out of active broker and reset sessions."""
     global broker_client
+    if runner.has_unsettled_orders():
+        raise HTTPException(status_code=409,detail="Cannot disconnect with open/pending trades")
     if broker_client:
         try:
             broker_client.close_websocket()
@@ -162,87 +175,17 @@ def disconnect_broker() -> ApiResponse:
 
 
 @app.get("/upstox/callback", response_class=HTMLResponse)
-def upstox_callback(code: str = None, error: str = None) -> HTMLResponse:
-    """Handle the OAuth authorization callback from Upstox API directly on port 8005."""
+def upstox_callback(code: str = "", state: str = "", error: str = ""):
+    client=get_active_client()
     if error:
-        return HTMLResponse(content=f"""
-        <html>
-        <head><title>Upstox Login Failed</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #fce8e6;">
-                <h2 style="color: #c5221f;">&#10060; Upstox Login Failed</h2>
-                <p>Error code: {error}</p>
-            </div>
-        </body>
-        </html>
-        """, status_code=400)
-
-    if not code:
-        return HTMLResponse(content="""
-        <html>
-        <head><title>Upstox Login Failed</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #fce8e6;">
-                <h2 style="color: #c5221f;">&#10060; Upstox Login Failed</h2>
-                <p>No authorization code received.</p>
-            </div>
-        </body>
-        </html>
-        """, status_code=400)
-
-    # Exchange the code
-    try:
-        global broker_client
-        curr_settings = reload_settings()
-
-        # Instantiate Upstox client
-        from brokers.upstox.client import UpstoxClient
-        broker_client = UpstoxClient(curr_settings)
-
-        ok = broker_client.connect_oauth_code(code)
-        if ok:
-            runner.broker = broker_client
-            return HTMLResponse(content="""
-            <html>
-            <head><title>Upstox Login Successful</title></head>
-            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #e6f4ea;">
-                    <h2 style="color: #137333;">&#10003; Upstox Login Successful!</h2>
-                    <p>Session token generated and validated successfully.</p>
-                    <p>Redirecting you back to your Trade Terminal...</p>
-                    <script>
-                        setTimeout(function() {
-                            window.location.href = "/";
-                        }, 2000);
-                    </script>
-                </div>
-            </body>
-            </html>
-            """)
-        else:
-            return HTMLResponse(content=f"""
-            <html>
-            <head><title>Upstox Login Failed</title></head>
-            <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #fce8e6;">
-                    <h2 style="color: #c5221f;">&#10060; Upstox Login Failed</h2>
-                    <p>Failed to establish session: {broker_client.last_error}</p>
-                </div>
-            </body>
-            </html>
-            """, status_code=400)
-    except Exception as exc:
-        return HTMLResponse(content=f"""
-        <html>
-        <head><title>Upstox Login Failed</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-            <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #fce8e6;">
-                <h2 style="color: #c5221f;">&#10060; Upstox Login Exception</h2>
-                <p>{exc}</p>
-            </div>
-        </body>
-        </html>
-        """, status_code=500)
+        return HTMLResponse("<h2>Login failed</h2><p>"+escape(error)+"</p>",status_code=400)
+    if client.settings.active_broker != "upstox" or not code:
+        raise HTTPException(status_code=400,detail="No pending Upstox authorization")
+    ok=client.connect_oauth_code(code,state=state)
+    if not ok:
+        return HTMLResponse("<h2>Login failed</h2><p>"+escape(client.last_error or "Authorization failed")+"</p>",status_code=400)
+    runner.attach_broker(client)
+    return HTMLResponse('<h2>Login successful</h2><a href="/">Return to terminal</a>')
 
 
 @app.get("/api/status")
@@ -256,6 +199,8 @@ def status() -> ApiResponse:
 def settings_reload() -> ApiResponse:
     """Reload environment variables from .env and clear cached credentials settings."""
     global broker_client
+    if runner.has_unsettled_orders():
+        raise HTTPException(status_code=409,detail="Cannot reload broker configuration with unsettled trades")
     curr_settings = reload_settings()
     if broker_client:
         broker_client.settings = curr_settings
@@ -327,35 +272,23 @@ def instruments_refresh() -> ApiResponse:
 @app.post("/api/zebu/connect")
 def legacy_zebu_connect() -> ApiResponse:
     """Legacy endpoint mapping for backwards compatibility."""
-    client = get_active_client()
-    try:
-        ok = client.connect_with_token()
-        if not ok:
-            ok = client.connect_auto_oauth()
-        if ok:
-            client.ensure_instruments_daily()
-        return ApiResponse(ok=ok, data=client.status(), error=client.last_error if not ok else None)
-    except Exception as exc:
-        return ApiResponse(ok=False, data=client.status(), error=str(exc))
+    return connect_broker(ConnectRequest(broker=get_settings().active_broker))
 
 
-@app.post("/api/broker/oauth-code/{auth_code}")
-def broker_oauth(auth_code: str) -> ApiResponse:
-    """Establish connection session with a manual callback authorization code."""
-    client = get_active_client()
-    try:
-        ok = client.connect_oauth_code(auth_code)
-        if ok:
-            client.ensure_instruments_daily()
-        return ApiResponse(ok=ok, data=client.status(), error=None if ok else client.last_error)
-    except Exception as exc:
-        return ApiResponse(ok=False, data=client.status(), error=str(exc))
+class OAuthCodeRequest(BaseModel):
+    code: str
+    state: str
 
 
-@app.post("/api/zebu/oauth-code/{auth_code}")
-def legacy_zebu_oauth(auth_code: str) -> ApiResponse:
-    """Legacy callback mapping."""
-    return broker_oauth(auth_code)
+@app.post("/api/broker/oauth-code")
+def broker_oauth(request: OAuthCodeRequest):
+    client=get_active_client()
+    if runner.has_unsettled_orders() and client.connected:
+        raise HTTPException(status_code=409,detail="Do not replace an active session while trading")
+    ok=client.connect_oauth_code(request.code,state=request.state)
+    if ok:
+        runner.attach_broker(client)
+    return ApiResponse(ok=ok,data=client.status(),error=None if ok else client.last_error)
 
 
 # ==============================================================================
@@ -413,6 +346,14 @@ def intraday_start(request: IntradayRunRequest) -> ApiResponse:
         return ApiResponse(ok=True, data=runner.start(request))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/intraday/reconcile")
+def reconcile_submissions():
+    try:
+        return ApiResponse(ok=True,data=runner.reconcile_submissions())
+    except Exception as exc:
+        raise HTTPException(status_code=400,detail=str(exc)) from exc
 
 
 @app.post("/api/intraday/stop")
@@ -483,6 +424,8 @@ def intraday_cancel_manual_trade(request: ManualTradeCancelRequest) -> ApiRespon
 @app.post("/api/order")
 def order(request: OrderRequest) -> ApiResponse:
     """Submit a raw manual transaction order directly to the active broker (outside automation)."""
+    if request.confirm_live:
+        raise HTTPException(status_code=409,detail="Use tracked runner entry/manual controls for live orders")
     try:
         client = get_active_client()
         data = client.place_order(**request.model_dump())
@@ -513,9 +456,40 @@ def debug_order_history(order_id: str) -> ApiResponse:
 
 @app.on_event("startup")
 def startup_event():
-    # Start persistent Upstox OAuth callback server on port 8090
+    # A single owner prevents two processes from placing orders from the same state.
+    from utils.security import acquire_engine_lock
+    app.state.engine_lock = acquire_engine_lock()
+    # Loopback redirect bridge; the main callback owns state and token exchange.
     try:
         from brokers.upstox.client import start_persistent_callback_server
         start_persistent_callback_server()
     except Exception as exc:
         print(f"[STARTUP WARNING] Failed to initialize Upstox background server: {exc}")
+
+
+@app.middleware("http")
+async def protect_control_api(request: Request, call_next):
+    if request.url.path.startswith("/api/") and not authorized(request):
+        return JSONResponse({"detail":"Control authentication required"},status_code=401)
+    response=await call_next(request)
+    response.headers["Cache-Control"]="no-store"
+    response.headers["X-Content-Type-Options"]="nosniff"
+    response.headers["Content-Security-Policy"]="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'"
+    return response
+
+
+# Authorization codes must not appear in access logs.
+import logging
+class RedactOAuthAccessLogs(logging.Filter):
+    def filter(self, record):
+        if isinstance(record.args,tuple):
+            record.args=tuple(arg.split("?",1)[0]+"?<redacted>" if isinstance(arg,str) and "code=" in arg else arg for arg in record.args)
+        return True
+logging.getLogger("uvicorn.access").addFilter(RedactOAuthAccessLogs())
+
+@app.on_event("shutdown")
+def shutdown_event():
+    runner.stop()
+    handle = getattr(app.state, "engine_lock", None)
+    if handle:
+        handle.close()

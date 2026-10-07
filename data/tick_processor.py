@@ -1,4 +1,5 @@
-from datetime import datetime, time
+from utils.clock import market_time
+from datetime import datetime, time, timedelta
 from typing import Any
 
 from models.schemas import IntradayRunRequest
@@ -37,7 +38,9 @@ class DataFeedMixin:
 
         mode, steps = _strike_mode_from_moneyness(request.option_moneyness)
         for signal in strategy.get("signals", []):
-            signal_time = datetime.fromisoformat(signal["time"])
+            signal_time = market_time(signal["time"])
+            if signal_time + timedelta(minutes=request.timeframe_minutes) > now:
+                continue
             if signal_time.date() != today:
                 continue
             if request.trading_mode == "LONG" and signal["side"] != "BUY":
@@ -47,7 +50,7 @@ class DataFeedMixin:
             key = f"{signal['time']}|{signal['side']}|{signal['option_type']}"
             if key in self.seen_signal_keys:
                 continue
-            if self.started_at and signal_time < self.started_at:
+            if self.started_at and signal_time + timedelta(minutes=request.timeframe_minutes) <= market_time(self.started_at):
                 continue
             # Already cached this tick
             if key in cache:
@@ -115,8 +118,4 @@ class DataFeedMixin:
             order["quote_error"] = None
             return price
         order["quote_error"] = error
-        if order.get("option_ltp") is not None:
-            return float(order["option_ltp"])
-        if order["instrument_type"] == "Option":
-            return None
-        return float(order.get("option_ltp") or fallback)
+        return None

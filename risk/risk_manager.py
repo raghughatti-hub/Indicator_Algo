@@ -31,8 +31,10 @@ class RiskManagerMixin:
         if not signal:
             return None
         status = str(signal.get("status") or "").upper()
-        if status in {"SL", "TP1", "TP2", "TP3", "TSL", "OPPOSITE"}:
-            return f"STRATEGY_{status}"
+        terminal = signal.get("closed", False)
+        reason = signal.get("exit_reason")
+        if terminal or status in {"SL", "TP3", "TSL", "OPPOSITE"} or "_TSL" in status or "_OPP" in status:
+            return f"STRATEGY_{reason or status}"
         return None
 
     @staticmethod
@@ -47,7 +49,7 @@ class RiskManagerMixin:
 
     def _update_trailing_stop(self, order: dict[str, Any], ltp: float, request: IntradayRunRequest, direction: int) -> None:
         """Calculate and apply Trailing SL transitions and move-to-cost updates on current LTP quote."""
-        entry = float(order["option_entry"])
+        entry = float(order.get("risk_entry") or order["option_entry"])
         profit_from_entry = (ltp - entry) * direction
         
         # Prefer order-level settings over request-level global settings

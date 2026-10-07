@@ -1,4 +1,5 @@
 from __future__ import annotations
+from utils.clock import market_now, market_time, candle_start
 
 import csv
 from dataclasses import dataclass, field
@@ -6,6 +7,10 @@ from datetime import datetime, time, timedelta
 import threading
 from typing import Any
 import uuid
+import copy
+import json
+import os
+from pathlib import Path
 
 from config.settings import BASE_DIR
 from models.schemas import IntradayRunRequest, OrderAdjustRequest
@@ -62,9 +67,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
         return self.broker
     lock: threading.RLock = field(default_factory=threading.RLock)
     
-    # order_lock guards paper_orders list mutations in the fast-path order watcher
-    # and the strategy signal loop independently of the main lock so the two threads
-    # never block each other for the expensive candle-fetch + strategy compute work.
+    # One shared reentrant lock owns mutable execution state. Candle computations
+    # run outside it; legacy order polling may hold it during bounded HTTP calls.
     order_lock: threading.RLock = field(default_factory=threading.RLock)
     
     active: bool = False
@@ -87,76 +91,170 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
     last_terminal_status_at: datetime | None = None
     last_terminal_message: str | None = None
     run_id: str = ""
+    entries_enabled: bool = False
+    recovery_required: bool = False
+    _state_unreadable: bool = False
+    state_path: Path | None = None
+    broker_identity: str | None = None
+
+    def __post_init__(self):
+        # Every state mutation and snapshot uses the same reentrant lock.
+        self.order_lock = self.lock
+        if self.state_path and self.state_path.exists():
+            try:
+                saved = json.loads(self.state_path.read_text())
+                self.paper_orders = saved.get("orders", [])
+                self.request = IntradayRunRequest.model_validate(saved["request"]) if saved.get("request") else None
+                self.broker_identity = saved.get("broker_identity")
+                self.trading_date = saved.get("trading_date")
+                self.seen_signal_keys = set(saved.get("seen_signal_keys", []))
+                self.day_pnl = sum(float(o.get("pnl") or 0) for o in self.paper_orders)
+                self.recovery_required = bool(self._open_paper_order())
+                for order in self.paper_orders:
+                    order["chasing_active"] = False
+                    order.pop("_management_active",None)
+                    order.pop("_broker_sync_at", None)
+                    if order.get("manual_submission") or order.get("status") in {"Entry_Submitting", "Exit_Submitting"}:
+                        if self._unsettled(order) and not order.get("submission_attempt"):
+                            order["manual_submission"]=False
+                            self._refresh_execution_state(order)
+                        else:
+                            order.update(status="Recovery_Required",submission_unknown=True,manual_submission=False)
+                if self.recovery_required:
+                    self.last_error = "Recovered positions require broker reconnection; new entries paused"
+            except Exception:
+                self._state_unreadable = True
+                self.recovery_required = True
+                self.last_error = "Saved trading state is unreadable; reconcile account before trading"
+
+    def _persist_state(self):
+        if self._state_unreadable:
+            raise RuntimeError("Refusing to overwrite unreadable execution state; reconcile account first")
+        if not self.state_path:
+            return
+        with self.lock:
+            data = dict(request=self.request.model_dump(mode="json") if self.request else None,
+                        orders=self.paper_orders,broker_identity=self.broker_identity,
+                        trading_date=self.trading_date,seen_signal_keys=sorted(self.seen_signal_keys))
+            self.state_path.parent.mkdir(parents=True,exist_ok=True)
+            import tempfile
+            fd, temporary = tempfile.mkstemp(dir=self.state_path.parent, prefix="state-", suffix=".json")
+            try:
+                with os.fdopen(fd,"w",encoding="utf-8") as handle:
+                    json.dump(data,handle,default=lambda v: v.isoformat() if hasattr(v,"isoformat") else str(v),allow_nan=False)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary,self.state_path)
+            except Exception:
+                self.entries_enabled = False
+                self.last_error = "Cannot persist trading state; new entries blocked"
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+                raise
+
+    @staticmethod
+    def _identity(broker):
+        import hashlib
+        settings = broker.settings
+        name = settings.active_broker
+        user = getattr(broker,"verified_account_id",None) or getattr(settings, f"{name}_user_id", "")
+        return hashlib.sha256(f"{name}:{user}".encode()).hexdigest()
+
+    def attach_broker(self, broker):
+        with self.lock:
+            identity = self._identity(broker)
+            if broker.connected and self._open_paper_order() and self.broker_identity and self.broker_identity != identity:
+                raise RuntimeError("Cannot switch broker/account with unsettled positions")
+            self.broker = broker
+            if self.recovery_required and self.request and broker.connected:
+                self.entries_enabled = False
+                self.active = True
+                self.recovery_required = False
+                self.run_id = str(uuid.uuid4())
+                self._start_workers()
+                self.last_error = None
+
+    def _start_workers(self):
+        self.thread = threading.Thread(target=self._loop,args=(self.run_id,),daemon=True)
+        self.order_thread = threading.Thread(target=self._order_watch_loop,args=(self.run_id,),daemon=True)
+        self.thread.start()
+        self.order_thread.start()
+
+    def has_unsettled_orders(self):
+        with self.lock:
+            return bool(self._open_paper_order())
+
 
     # --------------------------------------------------------------------------
     # Life-Cycle Management (Start, Stop, Status Reports)
     # --------------------------------------------------------------------------
 
     def start(self, request: IntradayRunRequest) -> dict[str, Any]:
-        """Start the intraday execution threads."""
         with self.lock:
-            if self.active:
-                raise RuntimeError("Intraday runner is already active. Stop it before starting a new scrip.")
+            if self.recovery_required:
+                raise RuntimeError(self.last_error or "Reconnect the original broker to recover positions")
+            if any(o.get("exit_intent",{}).get("active") for o in self.paper_orders):
+                raise RuntimeError("Finish pending exit instructions before resuming entries")
+            if any(o.get("submission_unknown") for o in self.paper_orders):
+                raise RuntimeError("Unknown submission requires account reconciliation; new entries blocked")
+            if request.live_trade and not request.continuous_execution:
+                raise RuntimeError("Live trading requires bounded continuous limit execution")
+            if self.active and self.entries_enabled:
+                raise RuntimeError("Runner already active")
+            if not self.broker or not self.broker.connected:
+                raise RuntimeError("Connect the broker before starting the runner")
             if request.live_trade and not self.zebu.settings.live_trading_enabled:
-                raise RuntimeError("Real Trade mode is blocked. Set LIVE_TRADING_ENABLED=true before starting live orders.")
-            
-            request.config.strike_interval = request.strike_interval
-            request.paper_trade = not request.live_trade
-            self.request = request
-            self.active = True
-            self.last_error = None
-            self.last_order_error = None
-            self.phase = "STARTING"
-            self.last_terminal_status_at = None
-            self.last_terminal_message = None
-            self.last_strategy = None
-            # Preserve the bar cache across same-day restarts ONLY if trading the same scrip, exchange, and timeframe.
-            # Wipe the cache to prevent corrupting indicators by mixing candles from different assets.
-            cache_date = getattr(self, "_cached_bars_date", None)
-            cache_symbol = getattr(self, "_cached_bars_symbol", None)
-            cache_timeframe = getattr(self, "_cached_bars_timeframe", None)
-            cache_exchange = getattr(self, "_cached_bars_exchange", None)
-            
-            today_str = datetime.now().date().isoformat()
-            current_symbol = request.underlying
-            current_timeframe = request.timeframe_minutes
-            current_exchange = request.exchange
-            
-            if (cache_date != today_str or 
-                cache_symbol != current_symbol or 
-                cache_timeframe != current_timeframe or 
-                cache_exchange != current_exchange):
-                self._cached_bars = None
-                self._cached_bars_date = today_str
-                self._cached_bars_symbol = current_symbol
-                self._cached_bars_timeframe = current_timeframe
-                self._cached_bars_exchange = current_exchange
-            if hasattr(self.zebu, "_quote_cache"):
-                self.zebu._quote_cache = {}
-                self.zebu._quote_cache_time = {}
-            if hasattr(self.zebu, "_token_cache"):
-                self.zebu._token_cache = {}
-            
-            today = datetime.now().date().isoformat()
-            if self.trading_date != today:
+                raise RuntimeError("Real Trade mode is blocked")
+            identity = self._identity(self.broker)
+            if self._open_paper_order():
+                if self.broker_identity and self.broker_identity != identity:
+                    raise RuntimeError("Open positions belong to a different broker/account")
+                if self.request and self.request.model_dump() != request.model_dump():
+                    raise RuntimeError("Open positions must retain their original configuration")
+                if any(self._unsettled(o) for o in self.paper_orders):
+                    raise RuntimeError("Settle pending orders before resuming entries")
+            today = market_now().date().isoformat()
+            if self.trading_date != today and not self._open_paper_order():
                 self.paper_orders = []
                 self.seen_signal_keys = set()
                 self.day_pnl = 0
-                self.broker_day_pnl = 0.0
                 self.trading_date = today
-                
-            self.started_at = datetime.now()
-            self.run_id = str(uuid.uuid4())
-            self.thread = threading.Thread(target=self._loop, args=(self.run_id,), daemon=True)
-            self.order_thread = threading.Thread(target=self._order_watch_loop, args=(self.run_id,), daemon=True)
-            self.thread.start()
-            self.order_thread.start()
+            if self.day_pnl >= request.max_profit or self.day_pnl <= request.max_loss:
+                raise RuntimeError("Daily risk limit reached; new entries blocked")
+            self.broker_identity = identity
+            request.config.strike_interval = request.strike_interval
+            request.paper_trade = not request.live_trade
+            self.request = request
+            cache_identity = (request.underlying,request.exchange,request.timeframe_minutes,today)
+            if getattr(self,"_cache_identity",None) != cache_identity:
+                self._cached_bars = None
+                self._cache_identity = cache_identity
+            self.started_at = market_now()
+            self.entries_enabled = True
+            self.last_error = None
+            self._persist_state()
+            if not self.active:
+                self.active = True
+                self.run_id = str(uuid.uuid4())
+                self._start_workers()
+            self.phase = "RUNNING"
         return self.status()
 
     def stop(self) -> dict[str, Any]:
-        """Request the active runner loops to stop execution."""
+        """Pause entries; preserve monitoring until every position/order is settled."""
         with self.lock:
-            self.active = False
+            self.entries_enabled = False
+            self.phase = "ENTRIES_PAUSED_PROTECTION_RUNNING"
+            for order in self.paper_orders:
+                if order.get("status") == "Idle":
+                    order.update(status="Entry_Rejected",entry_remarks="Unsubmitted entry cancelled on stop")
+                for record in list(self._unsettled(order,"ENTRY")):
+                    if not order.get("chasing_active") and not order.get("_management_active"):
+                        self._cancel_confirmed(order,record)
+            if not self._open_paper_order():
+                self.active = False
+                self.phase = "STOPPED"
+            self._persist_state()
         return self.status()
 
     def status(self) -> dict[str, Any]:
@@ -166,7 +264,6 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             
             strategy_copy = None
             if self.last_strategy:
-                import copy
                 strategy_copy = copy.deepcopy(self.last_strategy)
                 if self.request:
                     symbol_mode = self.request.symbol
@@ -206,6 +303,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                                 
             return {
                 "active": self.active,
+                "entries_enabled": self.entries_enabled,
+                "recovery_required": self.recovery_required,
                 "request": self.request.model_dump(mode="json") if self.request else None,
                 "last_error": self.last_error,
                 "last_order_error": self.last_order_error,
@@ -217,7 +316,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 "worker_alive": bool(self.thread and self.thread.is_alive()),
                 "order_worker_alive": bool(self.order_thread and self.order_thread.is_alive()),
                 "strategy": strategy_copy,
-                "paper_orders": list(self.paper_orders),
+                "paper_orders": copy.deepcopy(self.paper_orders),
                 "trade_mode": "REAL" if self.request and self.request.live_trade else "PAPER",
                 "day_pnl": self.day_pnl,
                 "broker_day_pnl": self.broker_day_pnl,
@@ -230,7 +329,9 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             self._log_terminal_status_locked()
             return {
                 "active": self.active,
-                "paper_orders": list(self.paper_orders),
+                "entries_enabled": self.entries_enabled,
+                "recovery_required": self.recovery_required,
+                "paper_orders": copy.deepcopy(self.paper_orders),
                 "trade_mode": "REAL" if self.request and self.request.live_trade else "PAPER",
                 "day_pnl": self.day_pnl,
                 "broker_day_pnl": self.broker_day_pnl,
@@ -247,64 +348,24 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
     # ==============================================================================
 
     def _loop(self, run_id: str) -> None:
-        """Main strategy polling and candle-fetching worker thread loop."""
         while True:
             with self.lock:
                 if not self.active or self.run_id != run_id or not self.request:
                     return
                 request = self.request
-            now = datetime.now()
-            exit_time = _parse_clock(request.exit_time, time(15, 15))
-            if not request.positional_trade:
-                if now.time() > exit_time:
-                    # 1. If we are past the exit time cutoff of 15:25 (3:25 PM), stop the runner
-                    if now.time() >= time(15, 25):
-                        if request.order_product_type == "MIS":
-                            # Check if any open orders exist
-                            open_order = self._open_paper_order()
-                            if open_order:
-                                # Trigger exits for orders that are still Active (not Exit_Pending)
-                                active_exists = any(o.get("status") == "Active" for o in self.paper_orders)
-                                if active_exists:
-                                    self._close_open_paper_orders("MIS_EXIT", now)
-                                # Wait for real trades to fill before stopping the runner
-                            else:
-                                with self.lock:
-                                    self.active = False
-                                    self.phase = "STOPPED_AFTER_EXIT_TIME"
-                                    self.last_update = now.isoformat(timespec="seconds")
-                                with self.order_lock:
-                                    self._log_orders_to_csv()
-                                return
-                        else:
-                            # For NRML: carry forward (do not close), stop runner immediately
-                            with self.lock:
-                                self.active = False
-                                self.phase = "STOPPED_AFTER_EXIT_TIME"
-                                self.last_update = now.isoformat(timespec="seconds")
-                            with self.order_lock:
-                                self._log_orders_to_csv()
-                            return
-                    else:
-                        # 2. Between exit_time and 15:25, keep running to trail active trades,
-                        # but if there are no active open orders left, shut down early.
-                        open_order = self._open_paper_order()
-                        if not open_order:
-                            with self.lock:
-                                self.active = False
-                                self.phase = "STOPPED_AFTER_EXIT_TIME"
-                                self.last_update = now.isoformat(timespec="seconds")
-                            with self.order_lock:
-                                self._log_orders_to_csv()
-                            return
-
-            self._tick(request)
-            open_order = self._open_paper_order()
-            if open_order:
-                sleep_time = max(5.0, float(request.poll_seconds))
-            else:
-                sleep_time = max(2.0, float(request.poll_seconds))
-            threading.Event().wait(sleep_time)
+                now = market_now()
+                cutoff = _parse_clock(request.exit_time,time(15,15))
+                if not request.positional_trade and now.time() >= cutoff:
+                    self.entries_enabled = False
+                    if request.order_product_type == "MIS":
+                        self._close_open_paper_orders("SESSION_EXIT",now)
+                if not self.entries_enabled and not self._open_paper_order():
+                    self.active = False
+                    self.phase = "STOPPED"
+                    self._persist_state()
+                    return
+            self._tick(request,run_id)
+            threading.Event().wait(max(2.,float(request.poll_seconds)))
 
     def _order_watch_loop(self, run_id: str) -> None:
         """High-frequency watch loop dedicated to checking active order status and price thresholds."""
@@ -318,33 +379,38 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 # order_lock ensures this fast-path loop is the sole writer of
                 # paper_orders price/SL/status fields. _tick() no longer calls
                 # _update_open_order_prices() so the two threads never collide.
+                snapshots=self._prepare_watch_quotes(request)
                 with self.order_lock:
-                    self._update_open_order_prices(request, strategy, allow_exit=True)
+                    self._update_open_order_prices(request, strategy, allow_exit=True, snapshots=snapshots)
                     self._log_orders_to_csv()
                 with self.lock:
-                    self.last_order_error = None
-                    self.last_order_update = datetime.now().isoformat(timespec="seconds")
+                    self.last_order_update = market_now().isoformat(timespec="seconds")
             except Exception as exc:
                 with self.lock:
                     self.last_order_error = str(exc)
-                    self.last_order_update = datetime.now().isoformat(timespec="seconds")
-            threading.Event().wait(request.order_watch_seconds)
+                    self.last_order_update = market_now().isoformat(timespec="seconds")
+            event=getattr(self.broker,"order_event",None)
+            if isinstance(event,threading.Event):
+                event.wait(request.order_watch_seconds)
+                event.clear()
+            else:
+                threading.Event().wait(request.order_watch_seconds)
 
-    def _tick(self, request: IntradayRunRequest) -> None:
+    def _tick(self, request: IntradayRunRequest, run_id: str | None = None) -> None:
         """Fetch candles, compile technical strategy calculations, and flag signals."""
         try:
-            now = datetime.now()
+            now = market_now()
             start_clock = _parse_clock(request.start_time, NSE_OPEN)
             # Automatically calculate lookback calendar days to ensure we always fetch at least 250 candles
             tf_mins = request.timeframe_minutes
             bars_per_day = 375.0 / max(1, tf_mins)
-            required_trading_days = int(250.0 / bars_per_day) + 1
+            required_trading_days = int(500.0 / bars_per_day) + 1
             # Add weekend/non-trading days buffer (approx 1.5x + 2 days)
             required_calendar_days = max(request.lookback_days, int(required_trading_days * 1.5) + 2)
             start = _today_session_start(now, start_clock) - timedelta(days=required_calendar_days)
             with self.lock:
                 self.phase = "FETCHING_BROKER_CANDLES"
-                self.last_update = datetime.now().isoformat(timespec="seconds")
+                self.last_update = market_now().isoformat(timespec="seconds")
             
             # get_bars() is a network call that can take several seconds.
             # It runs without holding any lock so the order watcher continues
@@ -378,6 +444,9 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 end=now,
             )
 
+            # Brokers may include an unfinished candle. Trade only closed candles.
+            current_start = candle_start(now,request.timeframe_minutes)
+            fetched_bars = [dict(b,time=market_time(b["time"])) for b in fetched_bars if market_time(b["time"]) < current_start]
             if fetched_bars:
                 if getattr(self, "_cached_bars", None) is not None:
                     merged = {b["time"]: b for b in self._cached_bars}
@@ -391,64 +460,18 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             bars = [dict(b) for b in (getattr(self, "_cached_bars", None) or [])]
             if not bars:
                 raise RuntimeError(f"No candle data returned from broker for {contract_symbol}. Check broker session or market hours.")
-            # Inject the real-time live LTP of the underlying into the bars list
-            # so the parent strategy indicators and Signals block P&L update in real time.
-            try:
-                underlying_ex = contract_exchange
-                underlying_sym = contract_symbol
-                if underlying_ex.upper() == "INDICES" or underlying_sym in ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]:
-                    idx_quote = self.zebu.get_single_index_quote(underlying_sym)
-                    live_ltp = idx_quote["ltp"] if idx_quote else None
-                else:
-                    broker_exchange = "NSE" if underlying_ex.upper() == "INDICES" else underlying_ex
-                    search_ex = "INDICES" if underlying_ex.upper() == "INDICES" else broker_exchange
-                    token = future_token if (underlying_ex == request.exchange and future_token) else self.zebu.search_token(search_ex, underlying_sym)
-                    if token:
-                        quote = self.zebu.get_quote(broker_exchange, token)
-                        live_ltp = self.zebu.quote_ltp(quote)
-                    if live_ltp is not None:
-                        T = request.timeframe_minutes
-                        candle_start = now.replace(minute=(now.minute // T) * T, second=0, microsecond=0)
-                        if bars:
-                            last_bar = bars[-1]
-                            last_time = last_bar["time"]
-                            if isinstance(last_time, str):
-                                last_time = datetime.fromisoformat(last_time)
-                            elif hasattr(last_time, "to_pydatetime"):
-                                last_time = last_time.to_pydatetime()
-                            
-                            last_time_naive = last_time.replace(tzinfo=None)
-                            candle_start_naive = candle_start.replace(tzinfo=None)
-                            
-                            if last_time_naive == candle_start_naive:
-                                last_bar["close"] = live_ltp
-                                last_bar["high"] = max(last_bar["high"], live_ltp)
-                                last_bar["low"] = min(last_bar["low"], live_ltp)
-                            elif last_time_naive < candle_start_naive:
-                                new_bar = {
-                                    "time": candle_start_naive,
-                                    "open": last_bar["close"],
-                                    "high": max(last_bar["close"], live_ltp),
-                                    "low": min(last_bar["close"], live_ltp),
-                                    "close": live_ltp,
-                                    "volume": 0
-                                }
-                                bars.append(new_bar)
-            except Exception as e:
-                # Silently ignore known transient broker rate limits or quote fetch failures to keep console clean
-                err_msg = str(e)
-                if "Quote fetch failed" not in err_msg and "rate limit" not in err_msg.lower():
-                    print(f"Error fetching/injecting live LTP for underlying: {e}", flush=True)
-
             with self.lock:
                 self.phase = "RUNNING_STRATEGY"
-                self.last_update = datetime.now().isoformat(timespec="seconds")
+                self.last_update = market_now().isoformat(timespec="seconds")
             strategy = run_strategy(bars, request.config)
             
-            if request.paper_trade or request.live_trade:
+            with self.lock:
+                if run_id is not None and (self.run_id != run_id or not self.active):
+                    return
+            if self.entries_enabled and (request.paper_trade or request.live_trade):
                 with self.lock:
                     self.phase = "UPDATING_PAPER_TRADES"
-                    self.last_update = datetime.now().isoformat(timespec="seconds")
+                    self.last_update = market_now().isoformat(timespec="seconds")
                 # ------------------------------------------------------------------
                 # TWO-PHASE SIGNAL ENTRY to keep order_lock free during broker calls:
                 #
@@ -461,11 +484,13 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 # ------------------------------------------------------------------
                 prefetch = self._prefetch_pending_signals(strategy, request, now)
                 with self.order_lock:
+                    if not self.entries_enabled or (run_id is not None and self.run_id != run_id):
+                        return
                     self._paper_trade_new_today_signals(strategy, request, now, prefetch_cache=prefetch)
                     self._log_orders_to_csv()
             with self.lock:
                 self.last_strategy = strategy
-                self.last_update = datetime.now().isoformat(timespec="seconds")
+                self.last_update = market_now().isoformat(timespec="seconds")
                 self.phase = "WAITING_FOR_NEXT_POLL"
                 self.last_error = None
                 # Print terminal status on every tick so the console stays live
@@ -475,7 +500,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             with self.lock:
                 self.last_error = str(exc)
                 self.phase = "ERROR"
-                self.last_update = datetime.now().isoformat(timespec="seconds")
+                self.last_update = market_now().isoformat(timespec="seconds")
                 self._log_terminal_status_locked(force=True)
 
 
@@ -496,6 +521,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
         Broker API work was already done in _prefetch_pending_signals() before
         this function is called, so the lock is held for <1 ms (pure memory ops).
         """
+        if not self.entries_enabled:
+            return
         today = now.date()
         start_clock = _parse_clock(request.start_time, NSE_OPEN)
         exit_clock = _parse_clock(request.exit_time, time(15, 15))
@@ -512,7 +539,9 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
         cache = prefetch_cache or {}
 
         for signal in sorted(strategy.get("signals", []), key=lambda item: item["time"], reverse=True):
-            signal_time = datetime.fromisoformat(signal["time"])
+            signal_time = market_time(signal["time"])
+            if signal_time + timedelta(minutes=request.timeframe_minutes) > now:
+                continue
             if signal_time.date() != today:
                 continue
             if request.trading_mode == "LONG" and signal["side"] != "BUY":
@@ -523,7 +552,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             key = f"{signal['time']}|{signal['side']}|{signal['option_type']}"
             if key in self.seen_signal_keys:
                 continue
-            if self.started_at and signal_time < self.started_at:
+            if self.started_at and signal_time + timedelta(minutes=request.timeframe_minutes) <= market_time(self.started_at):
                 self.seen_signal_keys.add(key)
                 continue
 
@@ -532,7 +561,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 1 for o in self.paper_orders
                 if o.get("status") not in {"Entry_Rejected", "QUOTE_ERROR"}
             )
-            if valid_trades_count >= request.max_trades_per_day and not open_orders:
+            if valid_trades_count >= request.max_trades_per_day:
                 self.last_skip_reason = f"Signal ignored because Max Trades Per Day is {request.max_trades_per_day}."
                 break
 
@@ -548,6 +577,10 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                     skip_signal = True
                     break
                 if self._close_order(o_ord, "OPPOSITE_SIGNAL", now):
+                    if o_ord.get("status") != "Closed":
+                        self.last_skip_reason = "Waiting for opposite position exit fill"
+                        skip_signal = True
+                        break
                     closed_orders.append(o_ord)
                 else:
                     self.last_skip_reason = "Opposite signal could not close the current order."
@@ -588,8 +621,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 self.last_skip_reason = "Conditional entry is waiting because Entry Limit Price is blank."
                 continue
 
-            sl_price = self._sl_price(entry_price, request) if entry_ready else None
-            target_price = self._target_price(entry_price, request) if entry_ready else None
+            sl_price = None
+            target_price = None
 
             order = {
                 "order_key": str(uuid.uuid4()),
@@ -603,6 +636,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 "live_trade": request.live_trade,
                 "market_open": market_open,
                 "quantity": request.qty,
+                "requested_quantity": request.qty,
                 "option_type": resolved_option_type if request.symbol == "Option" else ("FUT" if request.symbol == "Future" else "SPOT"),
                 "strike_mode": mode,
                 "strike": adjusted_strike,
@@ -663,7 +697,9 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 self.last_skip_reason = "New signal ignored because another order became active/pending first."
                 continue
 
+            self._reset_risk_levels(order,request)
             self.paper_orders.append(order)
+            self._persist_state()
 
             # Mark as seen ONLY after the order row is successfully appended.
             self.seen_signal_keys.add(key)
@@ -713,209 +749,196 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
 # SECTION 6: HIGH-FREQUENCY ORDER PROCESSOR & PRICE UPDATER
 # ==============================================================================
 
-    def _update_open_order_prices(self, request: IntradayRunRequest, strategy: dict[str, Any] | None = None, allow_exit: bool = True) -> None:
-        """Poll quotes for active orders, calculate MTM, adjust trailing stops, and handle limits/stops."""
-        strategy = strategy or {}
-        last_close = float(strategy.get("summary", {}).get("last_close") or 0)
-        total = 0.0
-        
-        # Throttled broker position sync
-        now_ts = datetime.now().timestamp()
-        if request.live_trade and (not hasattr(self, "_last_positions_sync_at") or (now_ts - self._last_positions_sync_at) >= 3.0):
-            self._last_positions_sync_at = now_ts
-            self._sync_broker_positions(request)
-            
-        for order in self.paper_orders:
+    def _reset_risk_levels(self, order, request):
+        if not request:
+            return
+        spot = request.sltp_instrument == "spot"
+        entry = float(order.get("spot_entry") if spot else (order.get("option_entry") or 0))
+        if entry <= 0:
+            return
+        direction = (1 if order.get("source_signal") == "BUY" else -1) if spot else (1 if order["side"] == "BUY" else -1)
+        sl_move = entry*request.stoploss_value/100 if request.sl_type=="percentage" else request.stoploss_value
+        target_move = entry*request.target_value/100 if request.target_type=="percentage" else request.target_value
+        initial = entry-direction*sl_move
+        if initial <= 0 or entry+direction*target_move <= 0:
+            raise ValueError("SL/target levels must be positive")
+        basis_changed = order.get("risk_instrument","option") != ("spot" if spot else "option")
+        order.update(risk_entry=entry,risk_direction=direction,risk_instrument="spot" if spot else "option",initial_stoploss=initial)
+        if not order.get("manual_stoploss"):
+            old=None if basis_changed else order.get("stoploss")
+            order["stoploss"] = initial if old is None else (max(old,initial) if direction==1 else min(old,initial))
+        if not order.get("manual_target"):
+            order["target"] = entry+direction*target_move
+
+    def _risk_ltp(self, order, request, option_ltp):
+        if request.sltp_instrument != "spot":
+            return option_ltp
+        name = _data_symbol(request.underlying)
+        if name in INDEX_DATA_SYMBOLS:
+            quote=self.zebu.get_single_index_quote(name)
+            if not quote or quote.get("error") or quote.get("stale") or quote.get("ltp") is None:
+                raise RuntimeError("Fresh underlying price unavailable for spot protection")
+            return float(quote["ltp"])
+        exchange=_data_exchange(request.exchange,request.underlying)
+        token=self.zebu.search_token(exchange,name)
+        return float(self.zebu.quote_ltp(self.zebu.get_quote(exchange,token)))
+
+    def _prepare_watch_quotes(self, request):
+        """Fetch risk quotes outside the state lock to keep control endpoints responsive."""
+        import time as clock
+        with self.order_lock:
+            orders=[o for o in self.paper_orders if o.get("status") in OPEN_ORDER_STATUSES]
+        snapshots={}
+        for order in orders:
+            quote,error=self._quote_snapshot(order)
+            captured_at=clock.monotonic()
+            risk,error_risk=None,None
+            if quote and not error and quote.get("ltp") is not None:
+                try:
+                    risk=self._risk_ltp(order,request,float(quote["ltp"]))
+                except Exception as exc:
+                    error_risk=type(exc).__name__
+            snapshots[self._order_row_key(order)]=(quote,error,risk,error_risk,captured_at)
+        return snapshots
+
+    def _start_position_sync(self, request):
+        if getattr(self,"_positions_sync_active",False):
+            return
+        self._positions_sync_active=True
+        def worker():
+            try:
+                self._sync_broker_positions(request)
+            finally:
+                with self.order_lock:
+                    self._positions_sync_active=False
+        threading.Thread(target=worker,daemon=True).start()
+
+    def _update_open_order_prices(self, request, strategy=None, allow_exit=True, snapshots=None):
+        strategy=strategy or {}
+        if not any(o.get("submission_unknown") for o in self.paper_orders):
+            self.last_order_error=None
+        if request.live_trade:
+            now=market_now().timestamp()
+            if now-getattr(self,"_last_positions_sync_at",0)>=3:
+                self._last_positions_sync_at=now
+                self._start_position_sync(request)
+        for order in list(self.paper_orders):
+            self._consume_order_updates(order)
             self._sync_broker_order_state(order)
-            if order["status"] == "Idle":
-                self._process_entry_order(order, request)
-                
-            if order["status"] not in ACTIVE_ORDER_STATUSES:
-                total += float(order.get("pnl") or 0)
+            self._start_execution_manager(order)
+            snapshot=snapshots.get(self._order_row_key(order)) if snapshots is not None else None
+            if snapshot is not None:
+                import time as clock
+                if clock.monotonic()-snapshot[4]>3:
+                    snapshot=(None,"Risk quote expired while waiting for another request",None,None,snapshot[4])
+            if order.get("status")=="Idle":
+                self._process_entry_order(order,request,quote_result=(snapshot[0],snapshot[1]) if snapshot is not None else None)
+            if int(order.get("quantity",0))<=0 or order.get("status") not in OPEN_ORDER_STATUSES:
                 continue
-                
-            ltp = self._current_order_ltp(order, last_close)
+            ltp=(snapshot[0] or {}).get("ltp") if snapshot is not None else self._current_order_ltp(order,0)
             if ltp is None:
-                order["quote_error"] = "Live option quote unavailable while updating order."
+                self.entries_enabled=False
+                self.last_order_error="Fresh quote unavailable; new entries paused, protection retrying"
                 continue
-                
-            order["option_ltp"] = ltp
-            
-            # Trigger any pending manual limit orders
-            if order.get("pending_manual_orders"):
-                remaining_pending = []
-                for p_order in order["pending_manual_orders"]:
-                    p_action = p_order["action"]
-                    p_qty = p_order["quantity"]
-                    p_price = p_order["price"]
-                    p_id = p_order.get("order_id")
-                    
-                    triggered = False
-                    fill_price = p_price
-                    
-                    if p_id: # Live trade pending manual order
-                        try:
-                            # Synchronize status from broker
-                            broker = self._broker_order_status(str(p_id))
-                            state = self._mapped_broker_state(broker)
-                            if state == "filled":
-                                triggered = True
-                                fill_price = _broker_avg_price(broker) or p_price
-                            elif state == "rejected" or state == "cancelled":
-                                # Discard it from pending queue (don't add to remaining)
-                                continue
-                        except Exception as e:
-                            # Log error and retry next tick
-                            print(f"[AutomationRunner] Error syncing pending manual order {p_id}: {e}", flush=True)
-                            remaining_pending.append(p_order)
-                            continue
-                    else: # Paper mode pending manual order
-                        if p_action == "BUY" and ltp <= p_price:
-                            triggered = True
-                        elif p_action == "SELL" and ltp >= p_price:
-                            triggered = True
-                    
-                    if triggered:
-                        self._apply_manual_trade_fill(order, p_action, p_qty, fill_price)
-                        order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-                        self.last_order_update = order["adjusted_at"]
+            order["option_ltp"]=ltp
+            if not order.get("live_trade"):
+                remaining=[]
+                for pending in order.get("pending_manual_orders",[]):
+                    marketable=(pending["action"]=="BUY" and ltp<=pending["price"]) or (pending["action"]=="SELL" and ltp>=pending["price"])
+                    if marketable:
+                        self._apply_manual_trade_fill(order,pending["action"],pending["quantity"],ltp)
                     else:
-                        remaining_pending.append(p_order)
-                
-                order["pending_manual_orders"] = remaining_pending
-                
-                # Check if position became closed as a result of manual fills
-                if order["status"] not in ACTIVE_ORDER_STATUSES:
-                    total += float(order.get("pnl") or 0)
-                    continue
-            
-            direction = 1 if order["side"] == "BUY" else -1
-            pnl = (ltp - order["option_entry"]) * direction * order["quantity"] + order.get("realized_pnl", 0.0)
-            order["pnl"] = pnl
-            total += pnl
-            
-            order_trailing = order.get("trailing_stoploss") if order.get("trailing_stoploss") is not None else request.trailing_stoploss
-            order_move_to_cost = order.get("move_sl_to_cost") if order.get("move_sl_to_cost") is not None else request.move_sl_to_cost
-            if order_trailing or order_move_to_cost:
-                self._update_trailing_stop(order, ltp, request, direction)
-
-            # Check if a newer opposite strategy signal has arrived after this order's entry
-            latest_signal = strategy.get("signals", [])[-1] if strategy.get("signals") else None
-            if latest_signal and allow_exit and order["status"] == "Active":
-                if str(latest_signal.get("side")) != str(order.get("source_signal")):
-                    sig_time_str = str(latest_signal.get("time"))
-                    ord_time_str = str(order.get("source_signal_time") or order.get("entry_time"))
-                    if sig_time_str > ord_time_str:
-                        self._close_order(order, "OPPOSITE_SIGNAL", datetime.now(), ltp)
-                        continue
-                
-            strategy_exit = self._sync_strategy_sltp(order, request, strategy)
-            if strategy_exit and allow_exit and order["status"] == "Active":
-                self._close_order(order, strategy_exit, datetime.now(), ltp)
+                        remaining.append(pending)
+                order["pending_manual_orders"]=remaining
+            else:
+                order["pending_manual_orders"]=[dict(action=r["side"],quantity=r["quantity"]-r["filled"],price=r["price"],order_id=r["order_id"]) for r in self._unsettled(order,"MANUAL")]
+            quantity=int(order.get("quantity",0))
+            direction=1 if order["side"]=="BUY" else -1
+            order["pnl"]=(ltp-order["option_entry"])*direction*quantity+order.get("realized_pnl",0.)
+            if order.get("submission_unknown"):
+                self.entries_enabled=False
+                self.last_order_error="Unknown submission requires reconciliation; risk decisions paused"
                 continue
-                
-            if request.sltp_instrument == "strategy":
-                # Check manual option-level SL and Target overrides even under strategy mode
-                hit_sl = False
-                hit_target = False
-                if order.get("manual_stoploss") and order.get("stoploss") is not None:
-                    hit_sl = ltp <= order["stoploss"] if order["side"] == "BUY" else ltp >= order["stoploss"]
-                if order.get("manual_target") and order.get("target") is not None:
-                    hit_target = ltp >= order["target"] if order["side"] == "BUY" else ltp <= order["target"]
-                if allow_exit and order["status"] == "Active":
-                    if hit_sl:
-                        is_trailed = bool(order.get("trail_active") or order.get("sl_moved_to_cost") or (order.get("initial_stoploss") is not None and order.get("stoploss") != order.get("initial_stoploss")))
-                        exit_reason = "TSL" if is_trailed else "SL"
-                        self._close_order(order, exit_reason, datetime.now(), ltp)
-                        continue
-                    elif hit_target:
-                        self._close_order(order, "TARGET", datetime.now(), ltp)
-                        continue
+            if quantity<=0:
                 continue
-                
-            hit_sl = ltp <= order["stoploss"] if order["side"] == "BUY" else ltp >= order["stoploss"]
-            hit_target = ltp >= order["target"] if order["side"] == "BUY" else ltp <= order["target"]
-            if allow_exit and order["status"] == "Active":
-                if hit_sl:
-                    is_trailed = bool(order.get("trail_active") or order.get("sl_moved_to_cost") or (order.get("initial_stoploss") is not None and order.get("stoploss") != order.get("initial_stoploss")))
-                    exit_reason = "TSL" if is_trailed else "SL"
-                    self._close_order(order, exit_reason, datetime.now(), ltp)
-                elif hit_target:
-                    self._close_order(order, "TARGET", datetime.now(), ltp)
-        self.day_pnl = total
+            self._reset_risk_levels(order,request)
+            risk_ltp=snapshot[2] if snapshot is not None else self._risk_ltp(order,request,ltp)
+            if risk_ltp is None:
+                self.entries_enabled=False
+                self.last_order_error="Fresh risk price unavailable; protection retrying"
+                continue
+            order["risk_ltp"]=risk_ltp
+            risk_direction=order["risk_direction"]
+            if request.sltp_instrument != "strategy":
+                self._update_trailing_stop(order,risk_ltp,request,risk_direction)
+            reason=None
+            latest=(strategy.get("signals") or [None])[-1]
+            if latest and latest.get("side")!=order.get("source_signal") and market_time(latest["time"])>market_time(order.get("source_signal_time") or order["entry_time"]):
+                reason="OPPOSITE_SIGNAL"
+            reason=reason or self._sync_strategy_sltp(order,request,strategy)
+            if request.sltp_instrument != "strategy" or order.get("manual_stoploss"):
+                hit=risk_ltp<=order["stoploss"] if risk_direction==1 else risk_ltp>=order["stoploss"]
+                if hit:
+                    reason="TSL" if order.get("trail_active") or order.get("sl_moved_to_cost") else "SL"
+            if request.sltp_instrument != "strategy" or order.get("manual_target"):
+                hit=risk_ltp>=order["target"] if risk_direction==1 else risk_ltp<=order["target"]
+                if hit and not reason:
+                    reason="TARGET"
+            if order.get("exit_intent",{}).get("active"):
+                reason=order["exit_intent"].get("reason") or "MANUAL_EXIT"
+            if reason and allow_exit:
+                self._close_order(order,reason,market_now(),ltp)
+        self.day_pnl=sum(float(o.get("pnl") or 0) for o in self.paper_orders)
+        if self.day_pnl>=request.max_profit or self.day_pnl<=request.max_loss:
+            self.entries_enabled=False
+            self.last_skip_reason="Daily risk limit reached; flattening and cancelling pending entries"
+            self._close_open_paper_orders("DAILY_LIMIT",market_now())
+        self._persist_state()
 
-    def _sync_broker_positions(self, request: IntradayRunRequest) -> None:
-        """Fetch positions from broker and synchronize quantities, entry prices, PnL, and import manual trades."""
-        if not self.broker or not self.zebu.connected:
+    def _sync_broker_positions(self, request):
+        broker=self.broker
+        if not broker or not broker.connected:
             return
-            
         try:
-            positions = self.zebu.get_positions()
-        except Exception as e:
-            print(f"[BrokerSync] Error fetching broker positions: {e}", flush=True)
-            return
-            
-        try:
-            if not positions:
-                positions = []
-            elif isinstance(positions, dict):
-                if positions.get("stat") == "Not_Ok":
+            positions=broker.get_positions()
+            if not isinstance(positions,list) or any(not isinstance(p,dict) or p.get("stat")=="Not_Ok" for p in positions):
+                raise RuntimeError("Broker positions unavailable; exposure is unknown")
+            with self.order_lock:
+                if self.broker is not broker:
                     return
-                positions = [positions]
-                
-            flat_positions = []
-            if isinstance(positions, list):
+                totals={}
+                self.broker_day_pnl=0.
                 for pos in positions:
-                    if isinstance(pos, dict) and pos.get("stat") != "Not_Ok":
-                        flat_positions.append(pos)
-                        
-            active_orders_map = {}
-            for order in self.paper_orders:
-                if order.get("status") in ACTIVE_ORDER_STATUSES and order.get("live_trade"):
-                    active_orders_map[order["tradingsymbol"]] = order
-                        
-            matched_tsyms = set()
-            underlying_prefix = request.underlying.upper().strip()
-            
-            total_broker_mtm = 0.0
-            
-            for pos in flat_positions:
-                tsym = pos.get("tsym")
-                if not tsym:
-                    continue
-                    
-                netqty = int(float(pos.get("netqty", 0)))
-                
-                # Check underlying prefix match
-                if underlying_prefix == "NIFTY" and tsym.upper().startswith("NIFTYNXT"):
-                    continue
-                if not tsym.upper().startswith(underlying_prefix):
-                    continue
-                    
-                urmtom = float(pos.get("urmtom") or 0.0)
-                rpnl = float(pos.get("rpnl") or 0.0)
-                total_broker_mtm += (urmtom + rpnl)
-                
-                matched_tsyms.add(tsym)
-                
-                if tsym in active_orders_map:
-                    order = active_orders_map[tsym]
-                    order["broker_net_qty"] = abs(netqty)
-                            
-            self.broker_day_pnl = total_broker_mtm
-            
-            # Check for active tracked orders that are absent at broker (closed/not created)
-            for tsym, order in active_orders_map.items():
-                if tsym not in matched_tsyms:
-                    order["broker_net_qty"] = 0
-                        
-        except Exception as e:
-            print(f"[BrokerSync] Error synchronizing broker positions: {e}", flush=True)
+                    symbol=pos.get("tsym")
+                    exchange=str(pos.get("exch") or pos.get("exchange") or "").upper()
+                    product=pos.get("prd")
+                    key=(exchange,symbol,product)
+                    totals[key]=totals.get(key,0)+int(float(pos.get("netqty",0)))
+                    if str(symbol).startswith(request.underlying):
+                        self.broker_day_pnl+=float(pos.get("urmtom") or 0)+float(pos.get("rpnl") or 0)
+                for order in self.paper_orders:
+                    if order.get("live_trade") and order.get("status") in OPEN_ORDER_STATUSES:
+                        key=((order.get("trade_contract") or {}).get("exchange"),order.get("tradingsymbol"),PRODUCT_TYPE_MAP[request.order_product_type])
+                        # Unknown exchange/product never supplies an exit-quantity cap.
+                        if not any(k[0] and k[2] for k in totals) and positions:
+                            order.pop("broker_net_qty",None)
+                            continue
+                        net=totals.get(key,0)
+                        direction=1 if order["side"]=="BUY" else -1
+                        order["broker_net_qty"]=max(0,net*direction)
+                        order["broker_position_checked_at"]=market_now().isoformat()
+        except Exception as exc:
+            with self.order_lock:
+                for order in self.paper_orders:
+                    order.pop("broker_net_qty",None)
+                self.entries_enabled=False
+                self.last_order_error=str(exc)
 
 
-# ==============================================================================
-# SECTION 10: USER-FACING CONTROL PANEL & ADJUSTMENT ACTIONS
-# ==============================================================================
+
+    # ==============================================================================
+    # SECTION 10: USER-FACING CONTROL PANEL & ADJUSTMENT ACTIONS
+    # ==============================================================================
 
     def adjust_order(self, request: OrderAdjustRequest) -> dict[str, Any]:
         """User action handler: manually adjust SL, Target, or Trailing parameters for an active order."""
@@ -923,6 +946,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
             order = self._find_order(request.order_key)
             if not order:
                 raise RuntimeError("Order row not found.")
+            if order.get("status") != "Active" or self._unsettled(order) or order.get("submission_unknown") or order.get("_management_active") or order.get("exit_intent",{}).get("active"):
+                raise RuntimeError("Adjustments require a settled active position")
             if request.stoploss is not None:
                 order["stoploss"] = float(request.stoploss)
                 order["manual_stoploss"] = True
@@ -941,8 +966,8 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 if bool(request.move_sl_to_cost):
                     order["move_sl_to_cost"] = True
                     if not order.get("sl_moved_to_cost", False):
-                        direction = 1 if order["side"] == "BUY" else -1
-                        cost_sl = float(order["option_entry"])
+                        direction = int(order.get("risk_direction", 1 if order["side"] == "BUY" else -1))
+                        cost_sl = float(order.get("risk_entry", order["option_entry"]))
                         current_sl = float(order["stoploss"])
                         if direction == 1:
                             if current_sl < cost_sl:
@@ -952,17 +977,14 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                                 order["stoploss"] = cost_sl
                         order["sl_moved_to_cost"] = True
                 else:
-                    if self.request:
-                        order["move_sl_to_cost"] = self.request.move_sl_to_cost
-                        order["move_sl_to_cost_points"] = self.request.move_sl_to_cost_points
-                    else:
-                        order["move_sl_to_cost"] = False
+                    order["move_sl_to_cost"] = False
             if request.move_sl_to_cost_points is not None:
                 order["move_sl_to_cost_points"] = float(request.move_sl_to_cost_points)
                 
             order["entry_remarks"] = order.get("entry_remarks") or "Manual controls updated"
-            order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
+            order["adjusted_at"] = market_now().isoformat(timespec="seconds")
             self.last_order_update = order["adjusted_at"]
+        self._persist_state()
         return self.orders_status()
 
     def exit_open_order(self) -> dict[str, Any]:
@@ -974,294 +996,93 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
                 self.last_error = None
             return self.status()
             
-        closed = self._close_order(order, "MANUAL_EXIT", datetime.now())
+        closed = self._close_order(order, "MANUAL_EXIT", market_now())
         with self.lock:
             if not closed:
                 self.last_error = "Manual exit failed. Check quote availability or live exit order response."
-            self.last_update = datetime.now().isoformat(timespec="seconds")
+            self.last_update = market_now().isoformat(timespec="seconds")
         return self.status()
 
-    def manual_trade_action(self, order_key: str, action: str, quantity: int, price_str: str) -> dict[str, Any]:
-        """Place manual BUY or SELL order for the active trade scrip, adjusting quantity and cost average."""
-        import time
-        
+    def manual_trade_action(self, order_key, action, quantity, price_str):
         with self.lock:
-            order = self._find_order(order_key)
+            order=self._find_order(order_key)
             if not order:
-                raise RuntimeError("No active order found matching the key.")
-            if order["status"] not in ACTIVE_ORDER_STATUSES:
-                raise RuntimeError(f"Order is not active (current status: {order['status']}).")
-            
-            contract = order.get("option_contract")
-            if not contract or contract.get("error"):
-                raise RuntimeError("No active option contract resolved.")
-            
-            # Extract variables needed for quote snapshot fetching and checks outside the lock
-            exchange = contract.get("exchange")
-            token = contract.get("token")
-            symbol_name = _contract_name(contract)
-            order_side = order["side"]
-            order_tick_size = order.get("tick_size")
-            order_option_ltp = order.get("option_ltp")
-            live_trade = order.get("live_trade", False)
-            
-            # Determine limit price based on market or manual price
-            price_str_clean = price_str.strip().lower()
-            is_market = price_str_clean in {"at mkt", "market", "", "mkt"}
-            
-            tradingsymbol = order.get("tradingsymbol") or ""
-            product_type = PRODUCT_TYPE_MAP.get(self.request.order_product_type if self.request else "MIS", "I")
-
-        if not token:
-            raise RuntimeError(f"No token for {symbol_name or 'contract'}.")
-
-        # Retrieve quote outside the lock to prevent blocking watcher loop on API delays
-        quote = None
-        error = None
+                raise ValueError("Order row not found")
+            if order.get("status")!="Active" or order.get("manual_submission") or order.get("_management_active") or order.get("exit_intent",{}).get("active") or self._unsettled(order):
+                raise RuntimeError("Manual action requires a settled active position")
+            self._validate_order_size(order,int(quantity))
+            reducing=action!=order["side"]
+            reserved=sum(p["quantity"] for p in order.get("pending_manual_orders",[]) if p["action"]!=order["side"])
+            if reducing and quantity>int(order["quantity"])-reserved:
+                raise ValueError("Reduction exceeds available position; reversal is not supported")
+            if not reducing and not self.entries_enabled:
+                raise RuntimeError("New exposure is paused")
+            order["manual_submission"]=True
+            self._persist_state()
         try:
-            quote = self.zebu.quote_snapshot(exchange, token)
-        except Exception as exc:
-            error = str(exc)
-            # Try to fall back to WebSocket cache if REST API fails or times out
-            try:
-                ws_key = (exchange.upper(), str(token))
-                if self.zebu._ws_feed_opened and ws_key in self.zebu._ws_quotes:
-                    ws_quote = self.zebu._ws_quotes[ws_key]
-                    ltp = self.zebu.quote_ltp(ws_quote)
-                    best_buy = self.zebu._quote_number(ws_quote, ("bp1", "best_buy", "best_bid", "bid", "b1", "bp"))
-                    best_sell = self.zebu._quote_number(ws_quote, ("sp1", "best_sell", "best_ask", "ask", "a1", "sp"))
-                    tick_size = self.zebu._quote_number(ws_quote, ("ti", "tick_size", "ticksize", "tick", "pp"))
-                    quote = {
-                        "raw": ws_quote,
-                        "ltp": ltp,
-                        "best_buy": best_buy,
-                        "best_sell": best_sell,
-                        "tick_size": tick_size or 0.05,
-                    }
-                    print(f"[manual_trade_action] Zebu REST API failed ({error}). Successfully fell back to WebSocket quote cache.", flush=True)
-            except Exception as ws_err:
-                print(f"[manual_trade_action] WebSocket cache fallback failed: {ws_err}", flush=True)
-
-        if not quote and is_market:
-            raise RuntimeError(error or f"Could not fetch quote snapshot for market price (Symbol: {symbol_name}, Token: {token}).")
-        
-        tick = float((quote or {}).get("tick_size") or order_tick_size or 0.05)
-        ltp = (quote or {}).get("ltp") or order_option_ltp
-        
-        if is_market:
-            # Same logic as aggressive entry/exit in Order Management
-            if action == order_side:
-                raw = (quote.get("best_buy") if action == "BUY" else quote.get("best_sell")) or ltp
-                if raw is None:
-                    raise RuntimeError("No quote price available for market entry.")
-                raw = raw + tick if action == "BUY" else raw - tick
-                price = self._round_to_tick(float(raw), tick, action)
-            else:
-                raw = quote.get("best_buy") if action == "SELL" else quote.get("best_sell")
-                raw = raw if raw is not None else ltp
-                if raw is None:
-                    raise RuntimeError("No quote price available for market exit.")
-                raw = raw + tick if action == "SELL" else raw - tick
-                price = self._round_to_tick(float(raw), tick, action)
-        else:
-            try:
-                price = self._round_to_tick(float(price_str), tick, action)
-            except ValueError:
-                raise RuntimeError(f"Invalid manual price format: {price_str}")
-        
-        if not live_trade:
-            # Paper Mode: queue as a pending limit order or fill immediately if marketable
+            quote,error=self._quote_snapshot(order)
+            if not quote:
+                raise ValueError(error or "Fresh quote required")
+            is_market=price_str.strip().lower() in {"at mkt","market","","mkt"}
+            raw=(quote.get("best_sell" if action=="BUY" else "best_buy") or quote.get("ltp")) if is_market else float(price_str)
+            price=self._round_to_tick(raw,order.get("tick_size") or .05,action)
+        except Exception:
             with self.lock:
-                order = self._find_order(order_key)
-                if not order or order["status"] not in ACTIVE_ORDER_STATUSES:
-                    raise RuntimeError("Order became inactive while fetching quote.")
-                
-                # Retrieve current option ltp or quote ltp
-                current_ltp = float(order.get("option_ltp") or ltp or 0.0)
-                
-                # Check trigger condition for pending limit order
-                is_pending = False
-                if not is_market:
-                    if action == "BUY" and price < current_ltp:
-                        is_pending = True
-                    elif action == "SELL" and price > current_ltp:
-                        is_pending = True
-                
-                if is_pending:
-                    # Queue it as a pending manual order
-                    if "pending_manual_orders" not in order:
-                        order["pending_manual_orders"] = []
-                    order["pending_manual_orders"].append({
-                        "action": action,
-                        "quantity": int(quantity),
-                        "price": price,
-                        "created_at": datetime.now().isoformat(timespec="seconds")
-                    })
-                    # Set temporary remarks to inform the user
-                    order["entry_remarks"] = f"Pending Manual {action} Limit @ {price:.2f} (Qty: {quantity})"
-                    order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-                    self.last_order_update = order["adjusted_at"]
+                order["manual_submission"]=False
+                self._persist_state()
+            raise
+        with self.lock:
+            if not order.get("live_trade"):
+                crossing=quote.get("best_sell" if action=="BUY" else "best_buy") or quote.get("ltp")
+                if (action=="BUY" and price<crossing) or (action=="SELL" and price>crossing):
+                    order.setdefault("pending_manual_orders",[]).append(dict(action=action,quantity=quantity,price=price))
                 else:
-                    # Fill immediately
-                    self._apply_manual_trade_fill(order, action, quantity, price)
-                    order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-                    self.last_order_update = order["adjusted_at"]
-                    
-            with self.order_lock:
-                self._log_orders_to_csv()
-            return self.orders_status()
-
-        # Outside the lock for Zebu REST calls to prevent blocking the watcher loop
-        try:
-            response = self.zebu.place_order(
-                exchange=exchange,
-                tradingsymbol=tradingsymbol,
-                side=action,
-                quantity=int(quantity),
-                product_type=product_type,
-                price_type="LMT",
-                price=price,
-                trigger_price=0,
-                confirm_live=True,
-            )
-            if response.get("paper"):
-                raise RuntimeError(response.get("message", "Live order blocked."))
-            if response.get("stat") == "Not_Ok":
-                raise RuntimeError(response.get("emsg", "Broker rejected order."))
-            order_id = self._order_id(response)
-            if not order_id:
-                raise RuntimeError("No order ID returned by broker.")
-        except Exception as exc:
-            raise RuntimeError(f"Live order placement failed: {exc}")
-        
-        # Poll the broker to check if filled
-        filled = False
-        fill_price = price
-        for _ in range(6): # 6 * 500ms = 3s
-            time.sleep(0.5)
-            broker_status = self._broker_order_status(str(order_id))
-            state = self._mapped_broker_state(broker_status)
-            if state == "filled":
-                filled = True
-                fill_price = _broker_avg_price(broker_status) or price
-                break
-            elif state == "rejected":
-                reason = _broker_message(broker_status) or "Broker rejected the order"
-                raise RuntimeError(f"Broker rejected: {reason}")
-        
-        if not filled:
-            # Queue as a pending manual order for live broker polling in background
-            with self.lock:
-                order = self._find_order(order_key)
-                if not order or order["status"] not in ACTIVE_ORDER_STATUSES:
-                    raise RuntimeError("Order became inactive while waiting for fill.")
-                
-                if "pending_manual_orders" not in order:
-                    order["pending_manual_orders"] = []
-                order["pending_manual_orders"].append({
-                    "action": action,
-                    "quantity": int(quantity),
-                    "price": price,
-                    "order_id": str(order_id),
-                    "created_at": datetime.now().isoformat(timespec="seconds")
-                })
-                # Set temporary remarks to inform the user
-                order["entry_remarks"] = f"Pending Manual {action} Limit @ {price:.2f} (Qty: {quantity})"
-                order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-                self.last_order_update = order["adjusted_at"]
-            with self.order_lock:
-                self._log_orders_to_csv()
-            return self.orders_status()
-        
-        with self.lock:
-            order = self._find_order(order_key)
-            if not order or order["status"] not in ACTIVE_ORDER_STATUSES:
-                raise RuntimeError("Order became inactive while waiting for fill.")
-            self._apply_manual_trade_fill(order, action, quantity, fill_price)
-            order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-            self.last_order_update = order["adjusted_at"]
-        with self.order_lock:
-            self._log_orders_to_csv()
-        return self.orders_status()
-
-    def cancel_manual_trade_action(self, order_key: str) -> dict[str, Any]:
-        """Cancel any pending manual limit orders for the active trade."""
-        with self.lock:
-            order = self._find_order(order_key)
-            if not order:
-                raise RuntimeError("No active order found matching the key.")
-            
-            pending_orders = order.get("pending_manual_orders", [])
-            if not pending_orders:
+                    self._apply_manual_trade_fill(order,action,quantity,float(crossing))
+                order["manual_submission"]=False
+                self._persist_state()
                 return self.orders_status()
-            
-            # If it is a live trade, cancel open orders at the broker
-            if order.get("live_trade"):
-                for p_order in pending_orders:
-                    p_id = p_order.get("order_id")
-                    if p_id:
-                        try:
-                            self.zebu.cancel_order(str(p_id))
-                        except Exception as e:
-                            print(f"[AutomationRunner] Error canceling broker order {p_id}: {e}", flush=True)
-            
-            # Clear pending manual orders list
-            order["pending_manual_orders"] = []
-            
-            # Reset remarks to original active state remarks
-            if order.get("status") == "Active":
-                order["entry_remarks"] = "Paper entry active" if not order.get("live_trade") else (order.get("entry_remarks") or "")
-            
-            order["adjusted_at"] = datetime.now().isoformat(timespec="seconds")
-            self.last_order_update = order["adjusted_at"]
-            
-        with self.order_lock:
-            self._log_orders_to_csv()
+        record=self._submit(order,action,price,"MANUAL",self.request,quantity)
+        with self.lock:
+            order["manual_submission"]=False
+            if record:
+                order.setdefault("pending_manual_orders",[]).append(dict(action=action,quantity=quantity,price=price,order_id=record["order_id"]))
+            self._persist_state()
         return self.orders_status()
 
+    def cancel_manual_trade_action(self, order_key):
+        with self.lock:
+            order=self._find_order(order_key)
+            if not order:
+                raise ValueError("Order row not found")
+            if order.get("manual_submission"):
+                raise RuntimeError("Manual submission is still in progress")
+            for record in list(self._unsettled(order,"MANUAL")):
+                if not self._cancel_confirmed(order,record):
+                    raise RuntimeError("Manual order cancellation not confirmed; still tracked")
+            order["pending_manual_orders"]=[]
+            self._persist_state()
+        return self.orders_status()
 
-    def _apply_manual_trade_fill(self, order: dict[str, Any], action: str, quantity: int, price: float) -> None:
-        """Apply a manual buy/sell fill to the active order, adjusting quantity and cost average."""
-        old_qty = int(order["quantity"])
-        old_entry = float(order["option_entry"])
-        direction = 1 if order["side"] == "BUY" else -1
-        
-        if action == order["side"]:
-            # Adding to position
-            new_qty = old_qty + quantity
-            new_entry = ((old_qty * old_entry) + (quantity * price)) / new_qty
-            order["quantity"] = new_qty
-            order["option_entry"] = new_entry
-            
-            # Recalculate SL and target if they are not manual
-            if self.request:
-                if not order.get("manual_stoploss"):
-                    sl_val = self._sl_price(new_entry, self.request)
-                    order["initial_stoploss"] = sl_val
-                    order["stoploss"] = sl_val
-                if not order.get("manual_target"):
-                    order["target"] = self._target_price(new_entry, self.request)
-            
-            order["entry_remarks"] = f"Added {quantity} qty @ {price:.2f}"
+    def _apply_manual_trade_fill(self, order, action, quantity, price):
+        old_qty=int(order.get("quantity",0))
+        old_entry=float(order.get("option_entry") or 0)
+        direction=1 if order["side"]=="BUY" else -1
+        if action==order["side"]:
+            order["quantity"]=old_qty+quantity
+            order["option_entry"]=(old_entry*old_qty+price*quantity)/(old_qty+quantity)
+            self._reset_risk_levels(order,self.request)
         else:
-            # Reducing position
-            trade_qty = min(quantity, old_qty)
-            new_qty = old_qty - trade_qty
-            
-            # Realize the P&L on the exited portion
-            realized = (price - old_entry) * direction * trade_qty
-            order["realized_pnl"] = order.get("realized_pnl", 0.0) + realized
-            
-            if new_qty == 0:
-                # Position is fully closed
-                self._mark_order_closed(order, "MANUAL_EXIT", datetime.now(), price, remaining_qty=0)
-                order["exit_remarks"] = f"Fully closed via manual Sell @ {price:.2f}"
-            else:
-                order["quantity"] = new_qty
-                # Update current active P&L
-                ltp = float(order.get("option_ltp") or price)
-                order["pnl"] = (ltp - old_entry) * direction * new_qty + order.get("realized_pnl", 0.0)
-                order["entry_remarks"] = f"Exited {trade_qty} qty @ {price:.2f}"
+            if quantity>old_qty:
+                self._unknown(order,"Broker reduction exceeded tracked quantity; reconcile actual position")
+                raise RuntimeError("Reduction exceeds tracked quantity")
+            order["quantity"]=old_qty-quantity
+            order["realized_pnl"]=order.get("realized_pnl",0.)+(price-old_entry)*direction*quantity
+            order["option_ltp"]=price
+            order["pnl"]=order["realized_pnl"]+(price-old_entry)*direction*order["quantity"]
+            if order["quantity"]==0 and not order.get("live_trade"):
+                self._mark_order_closed(order,"MANUAL_EXIT",market_now(),price,remaining_qty=0)
+        self._persist_state()
+
 
 
 # ==============================================================================
@@ -1287,7 +1108,7 @@ class IntradayRunner(DataFeedMixin, OrderManagerMixin, RiskManagerMixin):
 
     def _log_terminal_status_locked(self, force: bool = False) -> None:
         """Write regular execution metrics update messages to the system terminal stdout."""
-        now = datetime.now()
+        now = market_now()
         if not force and self.last_terminal_status_at:
             elapsed = (now - self.last_terminal_status_at).total_seconds()
             if elapsed < TERMINAL_STATUS_SECONDS:

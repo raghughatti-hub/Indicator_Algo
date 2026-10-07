@@ -16,7 +16,23 @@ def true_range(df: pd.DataFrame) -> pd.Series:
 
 
 def rma(series: pd.Series, length: int) -> pd.Series:
-    return series.ewm(alpha=1 / length, adjust=False, min_periods=length).mean()
+    if length <= 0:
+        raise ValueError("Indicator length must be positive")
+    result = pd.Series(np.nan, index=series.index, dtype=float)
+    seed = []
+    value = None
+    for i, item in enumerate(series):
+        if pd.isna(item):
+            continue
+        if value is None:
+            seed.append(float(item))
+            if len(seed) < length:
+                continue
+            value = sum(seed) / length
+        else:
+            value = (value * (length - 1) + float(item)) / length
+        result.iat[i] = value
+    return result
 
 
 def atr(df: pd.DataFrame, length: int) -> pd.Series:
@@ -59,8 +75,15 @@ def supertrend(df: pd.DataFrame, atr_len: int, factor: float) -> pd.DataFrame:
     direction = pd.Series(1, index=df.index, dtype=float)
     trend = pd.Series(np.nan, index=df.index, dtype=float)
 
-    for i in range(1, len(df)):
+    for i in range(len(df)):
+        if pd.isna(atr_val.iat[i]):
+            continue
         prev = i - 1
+        if i == 0 or pd.isna(trend.iat[prev]):
+            final_upper.iat[i] = upper.iat[i]
+            final_lower.iat[i] = lower.iat[i]
+            trend.iat[i] = lower.iat[i]
+            continue
         final_upper.iat[i] = (
             upper.iat[i]
             if upper.iat[i] < final_upper.iat[prev] or df["close"].iat[prev] > final_upper.iat[prev]

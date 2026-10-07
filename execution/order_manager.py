@@ -1,794 +1,583 @@
 import csv
-from datetime import datetime, time, timedelta
+import math
 import threading
+import time as monotonic_time
+from datetime import datetime, timedelta
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from typing import Any
 
-from config.settings import BASE_DIR
+from utils.clock import market_now, market_time
 from models.schemas import IntradayRunRequest
+from config.settings import BASE_DIR
 from utils.helpers import (
-    _broker_avg_price,
-    _broker_filled_qty,
-    _broker_message,
-    _broker_order_id,
-    _broker_value,
-    _clean_order_id,
-    _contract_name,
-    _flatten_broker_orders,
-    PRODUCT_TYPE_MAP,
-    ACTIVE_ORDER_STATUSES,
-    OPEN_ORDER_STATUSES,
-    FINAL_ORDER_STATUSES,
+    _broker_avg_price, _broker_filled_qty, _broker_message, _broker_order_id,
+    _broker_value, _clean_order_id, _contract_name, _flatten_broker_orders,
+    PRODUCT_TYPE_MAP, ACTIVE_ORDER_STATUSES, OPEN_ORDER_STATUSES, FINAL_ORDER_STATUSES,
 )
 
 
-class OrderManagerMixin:
-    """Mixin class for IntradayRunner handling order entry/exit formatting, broker API interactions, and CSV order logging."""
+from execution.limit_execution import LimitExecutionMixin
 
-    _BROKER_SYNC_INTERVAL: float = 2.0
 
-    def _entry_waits_for_blank_limit(self, request: IntradayRunRequest) -> bool:
-        """Check if limit trigger values are blank for conditional orders."""
+class OrderManagerMixin(LimitExecutionMixin):
+    """Confirmed-fill ledger. Unknown submissions never authorize a replacement."""
+    _BROKER_SYNC_INTERVAL = 2.0
+
+    def _save_state(self):
+        if hasattr(self, "_persist_state"):
+            self._persist_state()
+
+    def _entry_waits_for_blank_limit(self, request):
         return request.entry_order_mode in {"Limit_Below", "Limit_Above"} and request.entry_limit_price is None
 
     @staticmethod
-    def _round_to_tick(price: float, tick: float, side: str) -> float:
-        """Round decimal price values strictly according to exchange contract tick increments."""
-        tick = tick or 0.05
-        steps = price / tick
-        rounded_steps = int(steps) if side == "SELL" else int(steps + 0.999999)
-        return round(max(tick, rounded_steps * tick), 2)
+    def _round_to_tick(price, tick, side):
+        if not math.isfinite(float(price)) or float(price) <= 0 or not math.isfinite(float(tick)) or float(tick) <= 0:
+            raise ValueError("Price and tick must be positive finite numbers")
+        px, step = Decimal(str(price)), Decimal(str(tick))
+        mode = ROUND_CEILING if side == "BUY" else ROUND_FLOOR
+        result = (px / step).to_integral_value(rounding=mode) * step
+        return float(max(step, result))
 
-    def _entry_limit_price(self, order: dict[str, Any], request: IntradayRunRequest) -> tuple[float | None, str | None]:
-        """Formulate the exact limit price for entry placement under different modes."""
-        quote, error = self._quote_snapshot(order)
+    def _entry_limit_price(self, order, request, quote_result=None):
+        quote, error = quote_result if quote_result is not None else self._quote_snapshot(order)
         if not quote:
             return None, error
         ltp = quote.get("ltp")
-        tick = float(quote.get("tick_size") or order.get("tick_size") or 0.05)
+        tick = float(order.get("tick_size") or quote.get("tick_size") or .05)
         order["option_ltp"] = ltp if ltp is not None else order.get("option_ltp")
-        mode = request.entry_order_mode
-    
-        if mode == "Aggressive_Entry":
-            raw = (quote.get("best_buy") if order["side"] == "BUY" else quote.get("best_sell")) or ltp
-            if raw is None:
-                return None, "No quote price available for aggressive entry."
-            raw = raw + tick if order["side"] == "BUY" else raw - tick
-            return self._round_to_tick(float(raw), tick, order["side"]), None
-        
-        if mode == "True_Limit_LTP":
-            return (self._round_to_tick(float(ltp), tick, order["side"]), None) if ltp is not None else (None, "No LTP for entry.")
-        
-        if request.entry_limit_price is None:
+        if request.entry_order_mode == "Aggressive_Entry":
+            raw = quote.get("best_sell" if order["side"] == "BUY" else "best_buy") or ltp
+            return (self._round_to_tick(raw, tick, order["side"]), None) if raw else (None, "Fresh bid/ask unavailable")
+        if request.entry_order_mode == "True_Limit_LTP":
+            return (self._round_to_tick(ltp, tick, order["side"]), None) if ltp else (None, "Fresh LTP unavailable")
+        trigger = request.entry_limit_price
+        if trigger is None or ltp is None:
             return None, None
-        
-        trigger = float(request.entry_limit_price)
-        if mode == "Limit_Below" and (ltp is None or ltp > trigger):
+        if request.entry_order_mode == "Limit_Below" and ltp > trigger:
             return None, None
-        if mode == "Limit_Above" and (ltp is None or ltp < trigger):
+        if request.entry_order_mode == "Limit_Above" and ltp < trigger:
             return None, None
         return self._round_to_tick(trigger, tick, order["side"]), None
 
-    def _exit_limit_price(self, order: dict[str, Any], request: IntradayRunRequest, exit_side: str) -> tuple[float | None, str | None]:
-        """Formulate the exact limit price for exit placement under different modes."""
+    def _exit_limit_price(self, order, request, exit_side):
         if request.exit_order_mode == "False":
-            return None, "Exit order mode is False."
+            return None, "Exit mode is disabled"
         quote, error = self._quote_snapshot(order)
         if not quote:
             return None, error
         ltp = quote.get("ltp")
-        tick = float(quote.get("tick_size") or order.get("tick_size") or 0.05)
-        order["option_ltp"] = ltp if ltp is not None else order.get("option_ltp")
-        mode = request.exit_order_mode
-    
-        if mode == "Aggressive_Exit":
-            raw = quote.get("best_buy") if exit_side == "SELL" else quote.get("best_sell")
-            raw = raw if raw is not None else ltp
-            if raw is None:
-                return None, "No quote price available for aggressive exit."
-            raw = raw + tick if exit_side == "SELL" else raw - tick
-            return self._round_to_tick(float(raw), tick, exit_side), None
-        
-        if mode == "True_Limit_LTP":
-            return (self._round_to_tick(float(ltp), tick, exit_side), None) if ltp is not None else (None, "No LTP for exit.")
-        
-        trigger = request.exit_limit_price if request.exit_limit_price is not None else order.get("target")
+        tick = float(order.get("tick_size") or quote.get("tick_size") or .05)
+        if request.exit_order_mode == "Aggressive_Exit":
+            raw = quote.get("best_buy" if exit_side == "SELL" else "best_sell") or ltp
+            return (self._round_to_tick(raw, tick, exit_side), None) if raw else (None, "Fresh bid/ask unavailable")
+        if request.exit_order_mode == "True_Limit_LTP":
+            return (self._round_to_tick(ltp, tick, exit_side), None) if ltp else (None, "Fresh LTP unavailable")
+        trigger = request.exit_limit_price
         if trigger is None:
-            return None, None
-        
-        trigger = float(trigger)
-        if mode == "Limit_Below" and (ltp is None or ltp > trigger):
-            return None, None
-        if mode == "Limit_Above" and (ltp is None or ltp < trigger):
+            return None, "Conditional exit requires an explicit limit price"
+        if ltp is None or (request.exit_order_mode == "Limit_Below" and ltp > trigger) or (request.exit_order_mode == "Limit_Above" and ltp < trigger):
             return None, None
         return self._round_to_tick(trigger, tick, exit_side), None
 
-    def _process_entry_order(self, order: dict[str, Any], request: IntradayRunRequest) -> None:
-        """Trigger broker entry order placement once trigger parameters match."""
-        if order.get("entry_order_id") or order.get("status") not in {"Idle"}:
+    def _validate_order_size(self, order, quantity):
+        if quantity <= 0:
+            raise ValueError("Quantity must be positive")
+        contract = order.get("trade_contract") or {}
+        lot = contract.get("lot_size")
+        if order.get("instrument_type") != "Spot":
+            if not lot or not math.isfinite(float(lot)) or int(lot) <= 0:
+                raise ValueError("Verified contract lot size is required for derivatives")
+            if quantity % int(lot):
+                raise ValueError(f"Quantity must be a multiple of lot size {int(lot)}")
+
+    def _unsettled(self, order, purpose=None):
+        return [r for r in order.get("broker_orders", []) if not r.get("terminal") and (purpose is None or r["purpose"] == purpose)]
+
+    def _unknown(self, order, message):
+        order["status"] = "Recovery_Required"
+        order["submission_unknown"] = True
+        order["last_exit_error"] = message
+        self.entries_enabled = False
+        self.last_order_error = message
+        self._save_state()
+
+    def _register(self, order, oid, purpose, side, quantity, price):
+        existing = next((r for r in order.get("broker_orders", []) if r["order_id"] == str(oid)), None)
+        if existing:
+            if (existing["purpose"], existing["side"], existing["quantity"]) != (purpose, side, int(quantity)):
+                raise RuntimeError("Broker order ID conflicts with saved execution intent")
+            return existing
+        record = dict(order_id=str(oid),purpose=purpose,side=side,quantity=int(quantity),price=float(price),filled=0,cost=0.,terminal=False)
+        order.setdefault("broker_orders", []).append(record)
+        if purpose != "MANUAL":
+            order["entry_order_id" if purpose == "ENTRY" else "exit_order_id"] = str(oid)
+        self._save_state()
+        return record
+
+    def _apply_broker_status(self, order, record, status):
+        state = self._mapped_broker_state(status)
+        if state == "unknown":
+            return state
+        filled = _broker_filled_qty(status)
+        if state == "filled" and filled == 0:
+            # COMPLETE is the broker's assertion that the accepted order fully filled.
+            filled = record["quantity"]
+        if filled < record["filled"] or filled > record["quantity"]:
+            self._unknown(order, "Inconsistent broker fill quantity; reconcile before further orders")
+            return "unknown"
+        avg = _broker_avg_price(status)
+        if filled > record["filled"]:
+            if avg is None or not math.isfinite(avg) or avg <= 0:
+                order["fill_reconciliation_required"]=True
+                self.entries_enabled=False
+                self.last_order_error = "Broker reported a fill without its price; awaiting reconciliation"
+                return "unknown"
+            order.pop("fill_reconciliation_required",None)
+            cost = filled * avg
+            delta = filled - record["filled"]
+            price = (cost - record["cost"]) / delta
+            record["filled"], record["cost"] = filled, cost
+            if record["purpose"] == "ENTRY":
+                old_qty = int(order.get("quantity", 0))
+                order["option_entry"] = ((order.get("option_entry", 0) or 0) * old_qty + delta * price) / (old_qty + delta)
+                order["quantity"] = old_qty + delta
+                self._reset_risk_levels(order, self.request)
+            else:
+                self._apply_manual_trade_fill(order, record["side"], delta, price)
+        if state in {"filled", "cancelled", "rejected"}:
+            record["terminal"] = True
+            record["terminal_state"] = state
+        self._refresh_execution_state(order)
+        self._save_state()
+        return state
+
+    def _refresh_execution_state(self, order):
+        if order.get("submission_unknown"):
             return
-
-        # 1. If trade_contract is missing or contains an "error", retry contract resolution
-        contract = order.get("trade_contract")
-        if not contract or contract.get("error"):
-            strike = order.get("strike")
-            option_type = order.get("option_type")
-            if strike is not None and option_type is not None:
-                new_contract = self._resolve_contract(request, int(strike), option_type)
-                if new_contract and not new_contract.get("error"):
-                    order["trade_contract"] = new_contract
-                    order["option_contract"] = new_contract
-                    order["tradingsymbol"] = _contract_name(new_contract)
-                    order["tick_size"] = request.tick_size or new_contract.get("tick_size") or new_contract.get("raw", {}).get("TickSize") or 0.05
-                    order["quote_error"] = None
-                    contract = new_contract
-                else:
-                    err_msg = (new_contract.get("error") if new_contract else None) or "Failed to resolve contract"
-                    order["quote_error"] = err_msg
-                    order["entry_remarks"] = f"Contract resolution retry failed: {err_msg}"
-                    order["quote_retry_count"] = order.get("quote_retry_count", 0) + 1
-                    if order["quote_retry_count"] >= 10:
-                        order["status"] = "QUOTE_ERROR"
-                    return
-
-        # 2. Get entry limit price
-        price, error = self._entry_limit_price(order, request)
-        if price is None or error:
-            err_msg = error or "Entry limit price not available yet"
-            order["quote_error"] = err_msg
-            order["entry_remarks"] = f"Quote retry: {err_msg}"
-            order["quote_retry_count"] = order.get("quote_retry_count", 0) + 1
-            if order["quote_retry_count"] >= 10:
-                order["status"] = "QUOTE_ERROR"
-                order["entry_remarks"] = f"Permanent quote error: {err_msg}"
-            return
-
-        # 3. If a valid price is found, proceed with entry
-        order["quote_retry_count"] = 0
-        order["quote_error"] = None
-        order["option_entry"] = price
-        order["option_ltp"] = price
-        order["entry_order_price"] = price
-
-        if order.get("stoploss") is None:
-            sl_val = self._sl_price(price, request)
-            order["initial_stoploss"] = sl_val
-            order["stoploss"] = sl_val
-        if order.get("target") is None:
-            tgt_val = self._target_price(price, request)
-            order["target"] = tgt_val
-
-        if not request.live_trade:
-            order["status"] = "Active"
-            order["entry_remarks"] = "Paper entry active"
-            return
-        
-        order["paper"] = False
-        if request.enable_price_chasing:
-            order["chasing_active"] = True
+        pending = self._unsettled(order)
+        if any(r["purpose"] == "EXIT" for r in pending):
+            order["status"] = "Exit_Pending"
+        elif any(r["purpose"] == "ENTRY" for r in pending):
             order["status"] = "Entry_Pending"
-            order["entry_remarks"] = "Starting entry price chasing..."
-            threading.Thread(
-                target=self._run_price_chasing_loop,
-                args=(order, order["side"], price, "ENTRY", request, int(order["quantity"]), True),
-                daemon=True
-            ).start()
+        elif int(order.get("quantity", 0)) > 0:
+            order["status"] = "Active"
+            order["exit_order_id"] = None
+        elif pending:
+            order["status"] = "Exit_Pending"
+        elif any(r.get("filled", 0) for r in order.get("broker_orders", [])):
+            self._mark_order_closed(order, order.get("pending_exit_reason") or "FILLED_EXIT", market_now(), order.get("option_ltp"), remaining_qty=0)
         else:
-            response, live_error = self._place_limit_order(order, order["side"], price, "ENTRY", request)
-            order["entry_order_response"] = response
-            order["entry_order_id"] = self._order_id(response)
-            order["entry_remarks"] = live_error or _broker_message(response)
-        
-            if live_error and not order["entry_order_id"]:
-                order["status"] = "Entry_Rejected"
-                order["quote_error"] = live_error
-            elif order["entry_order_id"]:
-                order["status"] = "Entry_Pending"
-            else:
-                order["status"] = "Entry_Rejected"
+            order["status"] = "Entry_Rejected"
 
-    def _place_limit_order(
-        self,
-        order: dict[str, Any],
-        side: str,
-        price: float,
-        reason: str,
-        request: IntradayRunRequest,
-        quantity: int | None = None,
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Perform raw limit order placement calling Zebu Client API."""
+    def _cancel_confirmed(self, order, record):
         try:
-            qty = quantity if quantity is not None else int(order["quantity"])
-            response = self.zebu.place_order(
-                exchange=order["trade_contract"]["exchange"],
-                tradingsymbol=order["tradingsymbol"],
-                side=side,
-                quantity=qty,
-                product_type=PRODUCT_TYPE_MAP.get(request.order_product_type, "I"),
-                price_type="LMT",
-                price=price,
-                trigger_price=0,
-                confirm_live=True,
-            )
-            if response.get("paper"):
-                return response, response.get("message", "Live order blocked.")
-            if response.get("stat") == "Not_Ok":
-                return response, response.get("emsg", f"{reason} order rejected.")
-            return response, None
-        except Exception as exc:
-            return None, f"{reason} order failed: {exc}"
-
-    def _place_market_order(
-        self,
-        order: dict[str, Any],
-        side: str,
-        reason: str,
-        request: IntradayRunRequest,
-        quantity: int,
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Perform aggressive limit order placement at any cost to emulate market order execution."""
-        try:
-            quote_val = 0.0
-            contract = order.get("option_contract")
-            if contract:
-                quote_val, _ = self._quote_ltp(contract)
-            if not quote_val:
-                quote_val = float(order.get("option_ltp") or order.get("option_entry") or 100.0)
-        
-            tick = float(order.get("tick_size") or 0.05)
-            if side == "BUY":
-                aggressive_price = quote_val * 1.10
-            else:
-                aggressive_price = quote_val * 0.90
-            
-            aggressive_price = self._round_to_tick(aggressive_price, tick, side)
-            print(f"[SWEEP] Placing aggressive limit {side} order at any cost: price={aggressive_price:.2f} qty={quantity} (LTP={quote_val:.2f})", flush=True)
-
-            response = self.zebu.place_order(
-                exchange=order["trade_contract"]["exchange"],
-                tradingsymbol=order["tradingsymbol"],
-                side=side,
-                quantity=quantity,
-                product_type=PRODUCT_TYPE_MAP.get(request.order_product_type, "I"),
-                price_type="LMT",
-                price=aggressive_price,
-                trigger_price=0,
-                confirm_live=True,
-            )
-            if response.get("paper"):
-                return response, response.get("message", "Live order blocked.")
-            if response.get("stat") == "Not_Ok":
-                return response, response.get("emsg", f"{reason} aggressive limit sweep rejected.")
-            return response, None
-        except Exception as exc:
-            return None, f"{reason} aggressive limit sweep failed: {exc}"
-
-    def _run_price_chasing_loop(
-        self,
-        order: dict[str, Any],
-        side: str,
-        initial_price: float,
-        reason: str,
-        request: IntradayRunRequest,
-        total_quantity: int,
-        is_entry: bool,
-    ) -> None:
-        """Asynchronous execution loop to guarantee 100% order execution via price chasing and market sweep fallback."""
-        import time
-        from datetime import datetime
-
-        print(f"[CHASE] Starting chasing thread for order={order.get('id')} side={side} qty={total_quantity} price={initial_price}", flush=True)
-
-        current_order_id = order.get("entry_order_id" if is_entry else "exit_order_id")
-        current_price = initial_price
-    
-        filled_qty_so_far = 0
-        order_fills = {}  # mapping order_id -> (filled_qty, avg_price)
-    
-        if current_order_id:
-            order_fills[current_order_id] = (0, current_price)
-        
-        retry_count = 0
-        start_time = datetime.now()
-    
-        timeout_seconds = request.chase_timeout_seconds
-        max_retries = request.chase_max_retries
-        slippage_pct = request.chase_slippage_pct
-        sweep_market = request.chase_sweep_market
-        tick = order.get("tick_size") or 0.05
-
-        def get_total_filled():
-            return sum(qty for qty, _ in order_fills.values())
-
-        # Main polling loop
-        while get_total_filled() < total_quantity:
-            now_time = datetime.now()
-            elapsed = (now_time - start_time).total_seconds()
-        
-            if elapsed >= timeout_seconds or retry_count >= max_retries:
-                print(f"[CHASE] Timeout/retries exceeded (elapsed={elapsed:.1f}s, retries={retry_count}). Triggering safeguard...", flush=True)
-                break
-            
-            if not current_order_id:
-                remaining = total_quantity - get_total_filled()
-                if remaining <= 0:
-                    break
-                print(f"[CHASE] Placing new limit order for remaining={remaining} @ price={current_price:.2f}", flush=True)
-                live_response, live_error = self._place_limit_order(order, side, current_price, reason, request, quantity=remaining)
-                current_order_id = self._order_id(live_response)
-            
-                with self.order_lock:
-                    if is_entry:
-                        order["entry_order_id"] = current_order_id
-                        order["entry_order_price"] = current_price
-                        order["entry_remarks"] = live_error or _broker_message(live_response)
-                    else:
-                        order["exit_order_id"] = current_order_id
-                        order["exit_order_price"] = current_price
-                        order["exit_remarks"] = live_error or _broker_message(live_response)
-                    
-                if not current_order_id:
-                    print(f"[CHASE] Failed to place limit order: {live_error}. Sleeping before retry...", flush=True)
-                    time.sleep(1.0)
-                    retry_count += 1
-                    continue
-                
-                order_fills[current_order_id] = (0, current_price)
-                retry_count += 1
-            
-            time.sleep(0.5)
-            try:
-                broker_status = self._broker_order_status(str(current_order_id))
-                state = self._mapped_broker_state(broker_status)
-                filled_qty = _broker_filled_qty(broker_status)
-                avg_price = _broker_avg_price(broker_status) or current_price
-            
-                order_fills[current_order_id] = (filled_qty, avg_price)
-            
-                if state == "filled" or get_total_filled() >= total_quantity:
-                    break
-                
-                if state == "rejected":
-                    print(f"[CHASE] Order {current_order_id} rejected. Resetting order ID to re-fire.", flush=True)
-                    current_order_id = None
-                    continue
-                
-                if is_entry:
-                    new_price, price_error = self._entry_limit_price(order, request)
-                else:
-                    new_price, price_error = self._exit_limit_price(order, request, side)
-            
-                if new_price is None or price_error:
-                    ltp, err = self._quote_ltp(order.get("option_contract"))
-                    new_price = ltp
-                
-                if new_price is not None:
-                    should_modify = False
-                    if side == "BUY" and new_price > current_price:
-                        should_modify = True
-                    elif side == "SELL" and new_price < current_price:
-                        should_modify = True
-                    
-                    if should_modify:
-                        print(f"[CHASE] Price moved from {current_price:.2f} to calculated {new_price:.2f}. Cancelling order {current_order_id}...", flush=True)
-                    
-                        try:
-                            self.zebu.cancel_order(str(current_order_id))
-                        except Exception as e:
-                            print(f"[CHASE] Error cancelling order: {e}", flush=True)
-                        
-                        cancel_confirmed = False
-                        for _ in range(25):  # up to 5 seconds
-                            time.sleep(0.2)
-                            b_stat = self._broker_order_status(str(current_order_id))
-                            b_state = self._mapped_broker_state(b_stat)
-                            filled_qty = _broker_filled_qty(b_stat)
-                            avg_price = _broker_avg_price(b_stat) or current_price
-                            order_fills[current_order_id] = (filled_qty, avg_price)
-                        
-                            if b_state in {"cancelled", "rejected", "filled"} or get_total_filled() >= total_quantity:
-                                cancel_confirmed = True
-                                break
-                            
-                        print(f"[CHASE] Cancel confirmation check done. Filled qty: {get_total_filled()}/{total_quantity}", flush=True)
-                        if get_total_filled() >= total_quantity:
-                            break
-                        
-                        if side == "BUY":
-                            max_allowed = initial_price * (1 + slippage_pct / 100.0)
-                            current_price = min(new_price, max_allowed)
-                        else:
-                            min_allowed = initial_price * (1 - slippage_pct / 100.0)
-                            current_price = max(new_price, min_allowed)
-                        
-                        current_price = self._round_to_tick(current_price, tick, side)
-                        current_order_id = None
-            except Exception as e:
-                print(f"[CHASE] Error in chase loop: {e}", flush=True)
-                time.sleep(1.0)
-            
-        # --- Safeguard / Market Sweep Fallback ---
-        final_filled = get_total_filled()
-        if final_filled < total_quantity:
-            remaining = total_quantity - final_filled
-            print(f"[CHASE] Safeguard triggered. Final filled={final_filled}/{total_quantity}. Remaining={remaining}", flush=True)
-        
-            if current_order_id:
-                try:
-                    print(f"[CHASE] Cancelling limit order {current_order_id} before sweep...", flush=True)
-                    self.zebu.cancel_order(str(current_order_id))
-                except Exception as e:
-                    print(f"[CHASE] Error cancelling order during safeguard: {e}", flush=True)
-                
-                for _ in range(15):  # up to 3 seconds
-                    time.sleep(0.2)
-                    b_stat = self._broker_order_status(str(current_order_id))
-                    b_state = self._mapped_broker_state(b_stat)
-                    filled_qty = _broker_filled_qty(b_stat)
-                    avg_price = _broker_avg_price(b_stat) or current_price
-                    order_fills[current_order_id] = (filled_qty, avg_price)
-                    if b_state in {"cancelled", "rejected", "filled"}:
-                        break
-                    
-            final_filled = get_total_filled()
-            remaining = total_quantity - final_filled
-        
-            if remaining > 0:
-                if sweep_market:
-                    print(f"[CHASE] Sweeping remaining {remaining} quantity with Market order...", flush=True)
-                    sweep_response, sweep_error = self._place_market_order(order, side, reason, request, quantity=remaining)
-                    sweep_id = self._order_id(sweep_response)
-                
-                    if sweep_id:
-                        sweep_filled = 0
-                        sweep_price = current_price
-                        for _ in range(15):  # up to 3 seconds
-                            time.sleep(0.2)
-                            b_stat = self._broker_order_status(str(sweep_id))
-                            b_state = self._mapped_broker_state(b_stat)
-                            if b_state == "filled":
-                                sweep_filled = _broker_filled_qty(b_stat)
-                                sweep_price = _broker_avg_price(b_stat) or current_price
-                                break
-                        if sweep_filled > 0:
-                            order_fills[sweep_id] = (sweep_filled, sweep_price)
-                    else:
-                        print(f"[CHASE] Market sweep order failed to place: {sweep_error}", flush=True)
-                else:
-                    print(f"[CHASE] Market sweep disabled. Remaining quantity left unfilled.", flush=True)
-
-        final_filled = get_total_filled()
-        total_cost = sum(qty * prc for qty, prc in order_fills.values())
-        avg_fill_price = total_cost / final_filled if final_filled > 0 else initial_price
-
-        print(f"[CHASE] Finished. Total filled={final_filled}/{total_quantity} @ avg_price={avg_fill_price:.2f}", flush=True)
-
-        with self.lock:
+            self.zebu.cancel_order(record["order_id"])
+        except Exception:
+            pass  # A failed cancel is never proof of cancellation.
+        for _ in range(10):
+            status = self._broker_order_status(record["order_id"])
             with self.order_lock:
-                if is_entry:
-                    if final_filled > 0:
-                        order["status"] = "Active"
-                        order["option_entry"] = avg_fill_price
-                        order["entry_order_price"] = avg_fill_price
-                    
-                        sl_val = self._sl_price(avg_fill_price, request)
-                        order["initial_stoploss"] = sl_val
-                        order["stoploss"] = sl_val
-                        tgt_val = self._target_price(avg_fill_price, request)
-                        order["target"] = tgt_val
-                    
-                        order["entry_remarks"] = f"Filled via Chasing @ {avg_fill_price:.2f}"
-                    else:
-                        order["status"] = "Entry_Rejected"
-                        order["entry_remarks"] = "Chasing completed with 0 filled quantity."
-                else:
-                    if final_filled > 0:
-                        self._mark_order_closed(order, reason, datetime.now(), avg_fill_price, remaining_qty=final_filled)
-                        order["exit_remarks"] = f"Exited via Chasing @ {avg_fill_price:.2f}"
-                    else:
-                        order["status"] = "Active"
-                        order["exit_order_id"] = None
-                        order["exit_order_price"] = None
-                        order["exit_remarks"] = "Chasing failed to execute any exit quantity."
-                    
-                order["chasing_active"] = False
+                self._apply_broker_status(order, record, status)
+            if record["terminal"]:
+                return True
+            monotonic_time.sleep(.1)
+        order["last_exit_error"] = "Cancellation unconfirmed; original order remains tracked"
+        self._save_state()
+        return False
 
-        self._normalize_order_rows()
-
-    def _sync_broker_order_state(self, order: dict[str, Any]) -> None:
-        """Poll the broker for order status updates, throttled to every 2 s per order.
-
-        Only Entry_Pending and Exit_Pending orders trigger REST API calls.
-        Active orders only need LTP quotes (handled separately in _current_order_ltp),
-        so they are skipped here to keep the order-watch loop fast.
-        """
-        if not order.get("live_trade"):
-            return
-
-        if order.get("chasing_active"):
-            return
-
-        needs_sync = (
-            (order.get("entry_order_id") and order.get("status") == "Entry_Pending")
-            or (order.get("exit_order_id") and order.get("status") == "Exit_Pending")
-        )
-        if not needs_sync:
-            return
-
-        # Throttle: skip if we polled this order less than 2 s ago
-        last_sync = order.get("_broker_sync_at")
-        now_ts = datetime.now().timestamp()
-        if last_sync is not None and (now_ts - last_sync) < self._BROKER_SYNC_INTERVAL:
-            return
-        order["_broker_sync_at"] = now_ts
-
-        if order.get("entry_order_id") and order.get("status") == "Entry_Pending":
-            broker = self._broker_order_status(str(order["entry_order_id"]))
-            order["broker_entry_status"] = broker
-            state = self._mapped_broker_state(broker)
-            if state == "filled":
-                avg_price = _broker_avg_price(broker)
-                if avg_price is not None:
-                    order["option_entry"] = avg_price
-                    order["entry_order_price"] = avg_price
-                order["status"] = "Active"
-                order["entry_remarks"] = _broker_message(broker) or order.get("entry_remarks")
-            elif state == "rejected":
-                reason = _broker_message(broker) or "Entry order rejected by broker"
+    def _process_entry_order(self, order, request, quote_result=None):
+        with self.order_lock:
+            if order.get("status") != "Idle" or not self.entries_enabled:
+                return
+            now = market_now()
+            from utils.helpers import _parse_clock, _is_market_time, NSE_OPEN, NSE_CLOSE
+            if not _is_market_time(now, _parse_clock(request.start_time,NSE_OPEN), _parse_clock(request.exit_time,NSE_CLOSE)):
                 order["status"] = "Entry_Rejected"
-                order["entry_remarks"] = reason
-                order["quote_error"] = reason
-                self.last_skip_reason = (
-                    f"Entry rejected for {order.get('tradingsymbol')}: {reason}. "
-                    "Waiting for the next candle signal."
-                )
-                print(
-                    f"[ORDER] Entry REJECTED for {order.get('tradingsymbol')} "
-                    f"id={order.get('entry_order_id')} reason={order.get('entry_remarks')}",
-                    flush=True,
-                )
-
-        if order.get("exit_order_id") and order.get("status") == "Exit_Pending":
-            broker = self._broker_order_status(str(order["exit_order_id"]))
-            order["broker_exit_status"] = broker
-            state = self._mapped_broker_state(broker)
-            if state == "filled":
-                exit_price = _broker_avg_price(broker) or order.get("option_ltp")
-                self._mark_order_closed(order, order.get("pending_exit_reason") or "Closed", datetime.now(), exit_price)
-                order["exit_remarks"] = _broker_message(broker) or order.get("exit_remarks")
-            elif state == "rejected":
-                exit_id = order.get("exit_order_id")
-                reason = _broker_message(broker) or "Exit order rejected by broker"
-                order["status"] = "Active"
-                order["exit_remarks"] = f"Exit rejected: {reason}"
-                order["last_exit_error"] = order["exit_remarks"]
-                order["exit_order_id"] = None
-                order["exit_order_price"] = None
-                self.last_skip_reason = (
-                    f"Exit rejected for {order.get('tradingsymbol')}: {reason}. "
-                    "Order row is Active again for the next exit check."
-                )
-                print(
-                    f"[ORDER] Exit REJECTED for {order.get('tradingsymbol')} "
-                    f"id={order.get('exit_order_id')} reason={order.get('exit_remarks')} — resetting to Active",
-                    flush=True,
-                )
-
-    def _broker_order_status(self, order_id: str) -> Any:
-        """Query individual order history from Zebu; falls back to order-book if history returns nothing."""
-        normalized_order_id = _clean_order_id(order_id)
-        try:
-            history = self.zebu.single_order_history(order_id)
-            best_item = self._best_broker_status(_flatten_broker_orders(history), "")
-            if best_item is not None:
-                return best_item
-            if isinstance(history, dict):
-                if history.get("stat") != "Not_Ok":
-                    if history.get("status") or history.get("Status") or history.get("stat"):
-                        return history
-        except Exception as exc:
-            print(f"[ORDER] single_order_history error for {order_id}: {exc}", flush=True)
-
-        # Fallback: scan order book for this order id (covers REJECTED orders that
-        # may not appear in single_order_history on Zebu/Shoonya API)
-        order_book_fetched = False
-        found_item = None
-        try:
-            order_book = self.zebu.get_order_book()
-            if isinstance(order_book, (list, dict)):
-                if isinstance(order_book, dict) and order_book.get("stat") == "Not_Ok":
-                    pass
+                order["entry_remarks"] = "Entry window closed"
+                self._save_state()
+                return
+            contract = order.get("trade_contract")
+            if not contract or contract.get("error"):
+                order["quote_error"] = "Exact contract unavailable; no order submitted"
+                return
+            quantity = int(order.get("requested_quantity", order["quantity"]))
+            try:
+                self._validate_order_size(order,quantity)
+            except ValueError as exc:
+                order["status"] = "Entry_Rejected"
+                order["entry_remarks"] = str(exc)
+                self._save_state()
+                return
+            price, error = self._entry_limit_price(order,request,quote_result=quote_result)
+            if price is None:
+                if error:
+                    order["quote_error"] = error
+                    order["quote_retry_count"] = order.get("quote_retry_count",0)+1
                 else:
-                    order_book_fetched = True
-                    found_item = self._best_broker_status(_flatten_broker_orders(order_book), normalized_order_id)
+                    order["entry_remarks"] = "Waiting for conditional price trigger"
+                    order["quote_error"] = None
+                return
+            if error:
+                order["quote_error"] = error
+                return
+            if not request.live_trade:
+                quote, error = quote_result if quote_result is not None else self._quote_snapshot(order)
+                if request.continuous_execution:
+                    intent=self._ensure_intent(order,"ENTRY",order["side"],price)
+                    if (market_now()-market_time(intent["created_at"])).total_seconds()>=request.entry_timeout_seconds:
+                        intent.update(active=False,state="EXPIRED")
+                        order.update(status="Entry_Rejected",quantity=0,entry_remarks="Paper entry expired")
+                        self._save_state()
+                        return
+                    price,problem=self._intent_price(order,intent,quote or {})
+                    if problem:
+                        intent["state"]=problem
+                        order["execution_alert"]=problem
+                        if problem=="PRICE_BOUNDARY_REACHED":
+                            intent["active"]=False
+                            order.update(status="Entry_Rejected",quantity=0)
+                        self._save_state()
+                        return
+                    intent.update(active=False,state="FILLED")
+                crossing = (quote or {}).get("best_sell" if order["side"] == "BUY" else "best_buy") or (quote or {}).get("ltp")
+                if not crossing or (order["side"] == "BUY" and price < crossing) or (order["side"] == "SELL" and price > crossing):
+                    order["entry_remarks"] = "Paper limit is not marketable; awaiting fill"
+                    return
+                order.update(status="Active",option_entry=float(crossing),option_ltp=float(crossing),entry_order_price=price,entry_remarks="Paper entry filled")
+                self._reset_risk_levels(order,request)
+                self._save_state()
+                return
+            import uuid
+            order.update(status="Entry_Submitting",requested_quantity=quantity,quantity=0,paper=False,entry_order_price=price,chase_batch=str(uuid.uuid4()))
+            self._save_state()
+        if request.continuous_execution:
+            self._ensure_intent(order,"ENTRY",order["side"],price)
+            self._start_execution_manager(order)
+        elif request.enable_price_chasing:
+            order["chasing_active"] = True
+            threading.Thread(target=self._run_price_chasing_loop,args=(order,order["side"],price,"ENTRY",request,quantity,True),daemon=True).start()
+        else:
+            self._submit(order,order["side"],price,"ENTRY",request,quantity)
+
+    def _submit(self, order, side, price, purpose, request, quantity):
+        with self.order_lock:
+            if (purpose == "ENTRY" or (purpose == "MANUAL" and side == order["side"])) and not self.entries_enabled:
+                order["status"] = "Active" if order.get("quantity",0)>0 else "Entry_Rejected"
+                self._save_state()
+                return None
+            import uuid
+            tag = "algo" + uuid.uuid4().hex
+            order["submission_attempt"] = dict(tag=tag,purpose=purpose,side=side,quantity=quantity,price=price)
+            self._save_state()
+        response,error = self._place_limit_order(order,side,price,purpose,request,quantity)
+        with self.order_lock:
+            if not response:
+                self._unknown(order,error or "Order submission outcome unknown")
+                return None
+            oid = self._order_id(response)
+            if not oid:
+                if response.get("paper") or response.get("stat") == "Not_Ok" or response.get("status") == "error":
+                    order.pop("submission_attempt", None)
+                    order["status"] = "Active" if order.get("quantity",0)>0 else "Entry_Rejected"
+                    order["entry_remarks" if purpose=="ENTRY" else "exit_remarks"] = error or _broker_message(response)
+                    self._save_state()
+                else:
+                    self._unknown(order,"Broker response lacks order ID; reconcile submission")
+                return None
+            record=self._register(order,oid,purpose,side,quantity,price)
+            record["tag"]=tag
+            order.pop("submission_attempt",None)
+            self._refresh_execution_state(order)
+            self._save_state()
+            return record
+
+    def _place_limit_order(self, order, side, price, reason, request, quantity=None):
+        try:
+            qty = int(order["quantity"]) if quantity is None else int(quantity)
+            try:
+                self._validate_order_size(order,qty)
+            except ValueError as exc:
+                return {"stat":"Not_Ok","emsg":str(exc)},str(exc)
+            response=self.zebu.place_order(exchange=order["trade_contract"]["exchange"],tradingsymbol=order["tradingsymbol"],side=side,quantity=qty,product_type=PRODUCT_TYPE_MAP[request.order_product_type],price_type="LMT",price=price,trigger_price=0,confirm_live=True,client_order_id=(order.get("submission_attempt") or {}).get("tag"))
+            if response and response.get("paper"):
+                return response,response.get("message","Live order blocked")
+            if response and response.get("stat")=="Not_Ok":
+                return response,response.get("emsg","Broker rejected order")
+            return response,None
         except Exception as exc:
-            print(f"[ORDER] get_order_book fallback error for {order_id}: {exc}", flush=True)
+            return None, f"{reason} submission outcome unknown: {type(exc).__name__}"
 
-        if found_item is not None:
-            return found_item
+    def _place_final_limit_order(self, order, side, reason, request, quantity):
+        # A bounded, marketable limit is safer than an unbounded +/-10% sweep.
+        quote,error=self._quote_snapshot(order)
+        raw=(quote or {}).get("best_sell" if side=="BUY" else "best_buy") or (quote or {}).get("ltp")
+        if not raw:
+            return {"stat":"Not_Ok","emsg":"Fresh quote unavailable"},error
+        anchor=order.get("entry_order_price") if reason=="ENTRY" else order.get("exit_order_price")
+        anchor=anchor or raw
+        cap=anchor*(1+request.chase_slippage_pct/100) if side=="BUY" else anchor*(1-request.chase_slippage_pct/100)
+        if (side=="BUY" and raw>cap) or (side=="SELL" and raw<cap):
+            return {"stat":"Not_Ok","emsg":"Slippage cap prevents marketable sweep"},"Slippage cap reached"
+        return self._place_limit_order(order,side,self._round_to_tick(raw,order.get("tick_size") or .05,side),reason,request,quantity)
 
-        # If history query failed/returned nothing and order book fetch succeeded but order ID is not found,
-        # it is a broker rejection (e.g. order rejected instantly before registering or invalid).
-        if order_book_fetched:
-            return {
-                "status": "REJECTED",
-                "stat": "Not_Ok",
-                "rejreason": "Order not found in broker history or order book"
-            }
+    def _run_price_chasing_loop(self, order, side, initial_price, reason, request, total_quantity, is_entry):
+        purpose="ENTRY" if is_entry else "EXIT"
+        deadline=monotonic_time.monotonic()+request.chase_timeout_seconds
+        attempts=0
+        record=None
+        try:
+            while attempts<request.chase_max_retries and monotonic_time.monotonic()<deadline:
+                if order.get("submission_unknown"):
+                    return
+                if order.get("abort_chasing") or (is_entry and not self.entries_enabled):
+                    break
+                filled=sum(r["filled"] for r in order.get("broker_orders",[]) if r["purpose"]==purpose and r.get("batch")==order.get("chase_batch"))
+                remaining=total_quantity-filled
+                if remaining<=0:
+                    break
+                price,error=(self._entry_limit_price(order,request) if is_entry else self._exit_limit_price(order,request,side))
+                if price is None or error:
+                    break
+                cap=initial_price*(1+request.chase_slippage_pct/100) if side=="BUY" else initial_price*(1-request.chase_slippage_pct/100)
+                tick=order.get("tick_size") or .05
+                cap=self._round_to_tick(cap,tick,"SELL" if side=="BUY" else "BUY")
+                price=min(price,cap) if side=="BUY" else max(price,cap)
+                record=self._submit(order,side,self._round_to_tick(price,order.get("tick_size") or .05,side),purpose,request,remaining)
+                attempts+=1
+                if record is None:
+                    return
+                record["batch"]=order.get("chase_batch")
+                monotonic_time.sleep(.2)
+                with self.order_lock:
+                    self._apply_broker_status(order,record,self._broker_order_status(record["order_id"]))
+                    if not record["terminal"] and not self._cancel_confirmed(order,record):
+                        return  # Still live/unknown: never replace or sweep.
+            if record and not record["terminal"]:
+                with self.order_lock:
+                    if not self._cancel_confirmed(order,record):
+                        return
+            if request.chase_sweep_market and not order.get("abort_chasing") and not order.get("submission_unknown") and (not is_entry or self.entries_enabled):
+                filled=sum(r["filled"] for r in order.get("broker_orders",[]) if r["purpose"]==purpose and r.get("batch")==order.get("chase_batch"))
+                remaining=total_quantity-filled
+                if remaining>0:
+                    # Keep the final limit in the ledger until a terminal status is confirmed.
+                    quote,error=(self._entry_limit_price(order,request) if is_entry else self._exit_limit_price(order,request,side))
+                    cap=initial_price*(1+request.chase_slippage_pct/100) if side=="BUY" else initial_price*(1-request.chase_slippage_pct/100)
+                    if quote and not error and ((side=="BUY" and quote<=cap) or (side=="SELL" and quote>=cap)):
+                        record=self._submit(order,side,quote,purpose,request,remaining)
+                        if record:
+                            record["batch"]=order.get("chase_batch")
+        except Exception as exc:
+            with self.order_lock:
+                self.last_order_error=f"Chasing stopped: {type(exc).__name__}; reconcile tracked order"
+        finally:
+            with self.order_lock:
+                order["chasing_active"]=False
+                self._refresh_execution_state(order)
+                self._save_state()
 
-        return None
+    def _consume_order_updates(self, order):
+        take=getattr(self.zebu,"take_order_update",None)
+        if not callable(take):
+            return
+        for record in list(self._unsettled(order)):
+            update=take(record["order_id"])
+            if update and _broker_filled_qty(update)>=record.get("filled",0):
+                self._apply_broker_status(order,record,update)
+
+    def _sync_broker_order_state(self, order):
+        if not order.get("live_trade") or order.get("chasing_active") or order.get("_management_active"):
+            return
+        if self.request and self.request.continuous_execution and any(order.get(k,{}).get("active") for k in ("entry_intent","exit_intent")):
+            return
+        now=monotonic_time.monotonic()
+        if now-order.get("_broker_sync_at",0)<self._BROKER_SYNC_INTERVAL:
+            return
+        order["_broker_sync_at"]=now
+        # Preserve and migrate saved IDs from earlier versions instead of losing them.
+        if not order.get("broker_orders"):
+            if order.get("entry_order_id") and order.get("status")=="Entry_Pending":
+                qty=int(order.get("requested_quantity",order.get("quantity",0)))
+                order["requested_quantity"]=qty
+                order["quantity"]=0
+                self._register(order,order["entry_order_id"],"ENTRY",order["side"],qty,order.get("entry_order_price") or order.get("option_entry") or 0)
+            elif order.get("exit_order_id") and order.get("status")=="Exit_Pending":
+                self._register(order,order["exit_order_id"],"EXIT","SELL" if order["side"]=="BUY" else "BUY",order["quantity"],order.get("exit_order_price") or order.get("option_ltp") or 0)
+        for record in list(self._unsettled(order)):
+            self._apply_broker_status(order,record,self._broker_order_status(record["order_id"]))
+
+    def reconcile_submissions(self):
+        """Adopt only an exact client-tag match; absence remains unknown."""
+        with self.order_lock:
+            book=self.zebu.get_order_book()
+            if not isinstance(book,list):
+                raise RuntimeError("Broker order book unavailable")
+            for order in self.paper_orders:
+                attempt=order.get("submission_attempt")
+                if not order.get("submission_unknown") or not attempt:
+                    continue
+                matches=[row for row in book if (row.get("remarks") or row.get("tag"))==attempt["tag"] and self._order_id(row)]
+                if len(matches)!=1:
+                    continue
+                row=matches[0]
+                order["submission_unknown"]=False
+                order["manual_submission"]=False
+                record=self._register(order,self._order_id(row),attempt["purpose"],attempt["side"],attempt["quantity"],attempt["price"])
+                order.pop("submission_attempt",None)
+                self._apply_broker_status(order,record,row)
+                self._refresh_execution_state(order)
+            self._save_state()
+            return self.orders_status()
+
+    def _broker_order_status(self, order_id):
+        try:
+            history=self.zebu.single_order_history(order_id)
+            result=self._best_broker_status(_flatten_broker_orders(history),_clean_order_id(order_id))
+            if result is not None:
+                return result
+        except Exception:
+            pass
+        try:
+            result=self._best_broker_status(_flatten_broker_orders(self.zebu.get_order_book()),_clean_order_id(order_id))
+            return result
+        except Exception:
+            return None
 
     @staticmethod
-    def _best_broker_status(rows: list[dict[str, Any]], order_id: str) -> dict[str, Any] | None:
-        """Pick the most meaningful broker row for one order id."""
-        best_item = None
-        best_rank = 0
-        for item in rows:
-            item_order_id = _broker_order_id(item)
-            if order_id and item_order_id and item_order_id != order_id:
-                continue
-            if order_id and not item_order_id:
-                continue
-            state = OrderManagerMixin._mapped_broker_state(item)
-            rank = 1
-            if state == "rejected":
-                rank = 2
-            elif state == "filled":
-                rank = 3
-            if rank > best_rank or best_item is None:
-                best_rank = rank
-                best_item = item
-        return best_item
+    def _best_broker_status(rows, order_id):
+        # SDK histories arrive newest first. Never rank an older fill over later cancellation.
+        matches=[r for r in rows if not order_id or _broker_order_id(r)==order_id]
+        return matches[0] if matches else None
 
     @staticmethod
-    def _mapped_broker_state(broker: Any) -> str:
-        """Decode multi-faceted broker response statuses into standard states: pending, filled, rejected."""
-        if not isinstance(broker, dict):
+    def _mapped_broker_state(broker):
+        if not isinstance(broker,dict):
+            return "unknown"
+        status=str(_broker_value(broker,("status","order_status","ordstatus","ord_status")) or "").upper().strip()
+        if status in {"COMPLETE","FILLED","TRADED","EXECUTED"}:
+            return "filled"
+        if status in {"CANCELLED","CANCELED"}:
+            return "cancelled"
+        if status in {"REJECTED","FAILED","REJECT"}:
+            return "rejected"
+        if status in {"OPEN","PENDING","TRIGGER_PENDING","TRIGGER PENDING","PARTIALLY FILLED","PARTIAL","VALIDATION PENDING","PUT ORDER REQ RECEIVED"}:
             return "pending"
-        # 1. Check the explicit 'status' field first — most reliable for Zebu/Shoonya
-        explicit_status = str(
-            _broker_value(
-                broker,
-                ("status", "Status", "order_status", "ordstatus", "ord_status", "stat"),
-            )
-            or ""
-        ).upper().strip()
-        if explicit_status in ("COMPLETE", "FILLED", "TRADED", "EXECUTED"):
-            return "filled"
-        if explicit_status in ("REJECTED", "CANCELLED", "CANCELED", "FAILED", "REJECT", "NOT_OK"):
-            return "rejected"
-        # 2. Fallback: substring scan across all relevant fields
-        raw = " ".join(
-            str(value)
-            for key, value in broker.items()
-            if any(word in str(key).lower() for word in ("status", "stat", "rej", "remark", "msg", "reason", "text"))
-        ).lower()
-        if any(word in raw for word in ("complete", "filled", "traded", "executed")):
-            return "filled"
-        # Comprehensive rejection detection: handles Zebu/Shoonya broker rejection states
-        # including 'REJECTED', 'CANCELLED', 'CANCELED', 'not_ok', insufficient funds msgs
-        if any(word in raw for word in ("reject", "cancel", "fail", "insufficient", "no fund", "margin", "block", "denied", "not found", "not_ok", "not ok", "nonsqroff", "negativecash", "not a multiple")):
-            return "rejected"
-        # If stat is explicitly Not_Ok with no order id context → rejection
-        if str(broker.get("stat", "")).lower() == "not_ok" and not _broker_order_id(broker):
-            return "rejected"
-        return "pending"
+        # An API error or a message containing 'filled' is not an order status.
+        return "unknown"
 
     @staticmethod
-    def _order_id(response: dict[str, Any] | None) -> str | None:
-        """Safely extract order ID string from a placing response dict."""
+    def _order_id(response):
         return _broker_order_id(response)
 
-    def _close_open_paper_orders(self, reason: str, now: datetime) -> None:
-        """Close out all active tracking order rows at session exit."""
-        total = 0.0
-        for order in self.paper_orders:
-            if order["status"] not in ACTIVE_ORDER_STATUSES:
-                total += float(order.get("pnl") or 0)
-                continue
-            self._close_order(order, reason, now)
-            total += float(order["pnl"])
-        self.day_pnl = total
+    def _close_open_paper_orders(self, reason, now):
+        for order in list(self.paper_orders):
+            if order.get("status") in OPEN_ORDER_STATUSES:
+                self._close_order(order,reason,now)
+        self.day_pnl=sum(float(o.get("pnl") or 0) for o in self.paper_orders)
 
-    def _close_order(self, order: dict[str, Any], reason: str, now: datetime, ltp: float | None = None) -> bool:
-        """Trigger an order close request by submitting opposite order parameters."""
-        if ltp is None:
-            ltp = self._current_order_ltp(order, float(order.get("option_ltp") or 0))
-        if ltp is None:
-            ltp = order.get("option_ltp")
-        if ltp is None:
-            ltp = order.get("option_entry")
-        if ltp is None:
-            return False
-        if order.get("status") not in ACTIVE_ORDER_STATUSES:
-            return False
-        if order.get("exit_order_id"):
-            return True
-        
-        if order.get("live_trade") and order.get("status") == "Active":
+    def _close_order(self, order, reason, now, ltp=None):
+        with self.order_lock:
+            if self.request and self.request.continuous_execution and order.get("live_trade") and order.get("status") in OPEN_ORDER_STATUSES:
+                if order.get("status")=="Idle":
+                    order.update(status="Entry_Rejected",entry_remarks="Unsubmitted entry cancelled")
+                    self._save_state()
+                    return True
+                if order.get("broker_net_qty") is not None and order["broker_net_qty"]<int(order.get("quantity",0)):
+                    order["last_exit_error"]="Broker/local quantity mismatch; reconcile exposure before exit"
+                    self.entries_enabled=False
+                    return False
+                reference=order.get("option_ltp") or order.get("option_entry")
+                if not reference:
+                    order["last_exit_error"]="Exit reference unavailable"
+                    return False
+                self._ensure_intent(order,"EXIT","SELL" if order["side"]=="BUY" else "BUY",float(reference),reason)
+                order["pending_exit_reason"]=reason
+                self._start_execution_manager(order)
+                return True
+            if order.get("status") in {"Exit_Submitting","Exit_Pending"} or self._unsettled(order,"EXIT"):
+                return True
+            if order.get("submission_unknown") or order.get("manual_submission") or order.get("_management_active"):
+                order["last_exit_error"]="Resolve outstanding submission before exit"
+                return False
+            if order.get("status") not in OPEN_ORDER_STATUSES:
+                return False
+            if order.get("chasing_active"):
+                order["abort_chasing"] = True
+                return False
+            for record in list(self._unsettled(order)):
+                if not self._cancel_confirmed(order,record):
+                    return False
+            if order.get("status")=="Idle":
+                order.update(status="Entry_Rejected",entry_remarks="Unsubmitted entry cancelled")
+                self._save_state()
+                return True
+            qty=int(order.get("quantity",0))
+            if qty<=0:
+                self._refresh_execution_state(order)
+                return not self._unsettled(order)
+            if not order.get("live_trade"):
+                quote,error=self._quote_snapshot(order)
+                side="SELL" if order["side"]=="BUY" else "BUY"
+                price=(quote or {}).get("best_buy" if side=="SELL" else "best_sell") or (quote or {}).get("ltp")
+                if not price:
+                    order["last_exit_error"]=error or "Fresh exit price unavailable"
+                    return False
+                if self.request and self.request.continuous_execution:
+                    intent=self._ensure_intent(order,"EXIT",side,float(price),reason)
+                    _,problem=self._intent_price(order,intent,quote)
+                    if problem:
+                        intent["state"]=problem
+                        order["execution_alert"]=problem
+                        self.entries_enabled=False
+                        self._save_state()
+                        return False
+                    intent.update(active=False,state="FILLED")
+                self._apply_manual_trade_fill(order,side,qty,float(price))
+                self._mark_order_closed(order,reason,now,float(price),remaining_qty=0)
+                self._save_state()
+                return True
             if not self.request:
                 return False
-        
-            # Cancel any pending manual limit orders first to free up margin and prevent order conflicts
-            pending_orders = order.get("pending_manual_orders", [])
-            if pending_orders:
-                import time
-                for p_order in pending_orders:
-                    p_id = p_order.get("order_id")
-                    if p_id:
-                        try:
-                            print(f"[CloseOrder] Cancelling pending manual order {p_id} before exit...", flush=True)
-                            self.zebu.cancel_order(str(p_id))
-                        except Exception as e:
-                            print(f"[CloseOrder] Error cancelling pending manual order {p_id}: {e}", flush=True)
-                order["pending_manual_orders"] = []
-                time.sleep(0.15)  # Brief sleep to allow broker to release blocked margin
-            
-            algo_qty = int(order["quantity"])
-            broker_qty = order.get("broker_net_qty", algo_qty)
-            exit_qty = min(algo_qty, broker_qty)
-        
-            if exit_qty <= 0:
-                print(f"[CloseOrder] Exit quantity capped to {exit_qty} <= 0. Skipping broker order and marking local order closed.", flush=True)
-                self._mark_order_closed(order, reason, now, ltp)
-                return True
+            if order.get("broker_net_qty") is not None and order["broker_net_qty"]<qty:
+                order["last_exit_error"]="Broker/local quantity mismatch; reconcile exposure before exit"
+                self.entries_enabled=False
+                return False
+            side="SELL" if order["side"]=="BUY" else "BUY"
+            exit_request = self.request.model_copy(update={"exit_order_mode":"Aggressive_Exit"}) if self._protective_reason(reason) else self.request
+            price,error=self._exit_limit_price(order,exit_request,side)
+            if price is None or error:
+                order["last_exit_error"]=error or "Waiting for exit limit condition"
+                return False
+            order.update(status="Exit_Submitting",pending_exit_reason=reason,exit_order_price=price)
+            self._save_state()
+        if self.request.continuous_execution:
+            self._ensure_intent(order,"EXIT",side,price,reason)
+            self._start_execution_manager(order)
+            return True
+        if self.request.enable_price_chasing:
+            import uuid
+            order["chase_batch"]=str(uuid.uuid4())
+            order["abort_chasing"]=False
+            order["chasing_active"]=True
+            threading.Thread(target=self._run_price_chasing_loop,args=(order,side,price,"EXIT",exit_request,qty,False),daemon=True).start()
+            return True
+        return self._submit(order,side,price,"EXIT",self.request,qty) is not None
 
-            exit_side = "SELL" if order["side"] == "BUY" else "BUY"
-            price, price_error = self._exit_limit_price(order, self.request, exit_side)
-            if price_error:
-                order["exit_remarks"] = price_error
-                order["last_exit_error"] = price_error
-                return False
-            if price is None:
-                return False
-            
-            if self.request.enable_price_chasing:
-                order["chasing_active"] = True
-                order["status"] = "Exit_Pending"
-                order["pending_exit_reason"] = reason
-                order["exit_remarks"] = "Starting exit price chasing..."
-                threading.Thread(
-                    target=self._run_price_chasing_loop,
-                    args=(order, exit_side, price, reason, self.request, exit_qty, False),
-                    daemon=True
-                ).start()
-                return True
-            else:
-                live_response, live_error = self._place_limit_order(order, exit_side, price, reason, self.request, quantity=exit_qty)
-                order["exit_order_response"] = live_response
-                order["exit_order_id"] = self._order_id(live_response)
-                order["exit_order_price"] = price
-                order["exit_remarks"] = live_error or _broker_message(live_response)
-            
-                if live_error:
-                    order["quote_error"] = live_error
-                    order["last_exit_error"] = live_error
-                    return False
-                if order["exit_order_id"]:
-                    order["status"] = "Exit_Pending"
-                    order["pending_exit_reason"] = reason
-                    return True
-                return False
-        
-        self._mark_order_closed(order, reason, now, ltp)
-        return True
-
-    def _mark_order_closed(self, order: dict[str, Any], reason: str, now: datetime, ltp: float | None = None, remaining_qty: int | None = None) -> None:
-        """Commit an order status locally as 'Closed', mapping PnL calculations."""
-        if ltp is None:
-            ltp = order.get("option_ltp")
-        direction = 1 if order["side"] == "BUY" else -1
-        order["option_ltp"] = ltp
-        order["option_exit"] = ltp
-        order["exit_time"] = now.isoformat(timespec="seconds")
-        order["status"] = "Closed"
-        order["exit_reason"] = reason
-    
-        if not order.get("live_trade") and order.get("entry_remarks") == "Paper entry active":
-            order["entry_remarks"] = "Paper entry closed"
-        if not order.get("live_trade"):
-            order["exit_remarks"] = reason
-        calc_qty = order["quantity"] if remaining_qty is None else remaining_qty
-        order["pnl"] = (float(ltp) - float(order["option_entry"])) * direction * calc_qty + order.get("realized_pnl", 0.0)
+    def _mark_order_closed(self, order, reason, now, ltp=None, remaining_qty=None):
+        qty=int(order.get("quantity",0)) if remaining_qty is None else int(remaining_qty)
+        if order.get("live_trade") and qty>0:
+            # This path cannot turn real exposure into a display-only closure.
+            raise RuntimeError("A live position closes only through confirmed fills")
+        direction=1 if order["side"]=="BUY" else -1
+        price=ltp if ltp is not None else order.get("option_ltp")
+        order.update(option_exit=price,exit_time=market_time(now).isoformat(),status="Closed",exit_reason=reason)
+        order["pnl"]=float(order.get("realized_pnl",0))+(float(price or 0)-float(order.get("option_entry") or 0))*direction*qty
+        order["closed_quantity"]=sum(r.get("filled",0) for r in order.get("broker_orders",[]) if r.get("purpose")=="ENTRY") or order.get("requested_quantity") or qty
+        order["quantity"]=0
+        order["pending_manual_orders"]=[]
+        order["exit_remarks"]=reason
+        self._save_state()
 
     def _log_orders_to_csv(self) -> None:
         """Log final status orders to orders.csv and keep only the last 30 days of entries."""
@@ -827,7 +616,7 @@ class OrderManagerMixin:
         existing_rows = []
         existing_keys = set()
     
-        thirty_days_ago = datetime.now() - timedelta(days=30)
+        thirty_days_ago = market_now() - timedelta(days=30)
     
         if csv_path.exists():
             try:
@@ -838,7 +627,7 @@ class OrderManagerMixin:
                         keep = True
                         if entry_time_str:
                             try:
-                                entry_dt = datetime.fromisoformat(entry_time_str)
+                                entry_dt = market_time(entry_time_str)
                                 if entry_dt < thirty_days_ago:
                                     keep = False
                             except ValueError:
@@ -880,7 +669,7 @@ class OrderManagerMixin:
                 keep = True
                 if entry_time_str:
                     try:
-                        entry_dt = datetime.fromisoformat(entry_time_str)
+                        entry_dt = market_time(entry_time_str)
                         if entry_dt < thirty_days_ago:
                             keep = False
                     except ValueError:
@@ -890,14 +679,14 @@ class OrderManagerMixin:
 
                 row = {
                     "order_key": okey,
-                    "trading_date": self.trading_date or datetime.now().date().isoformat(),
+                    "trading_date": self.trading_date or market_now().date().isoformat(),
                     "entry_time": o.get("entry_time") or o.get("time"),
                     "exit_time": o.get("exit_time"),
                     "underlying": o.get("underlying"),
                     "instrument_type": o.get("instrument_type"),
                     "tradingsymbol": o.get("tradingsymbol"),
                     "side": o.get("side"),
-                    "quantity": o.get("quantity"),
+                    "quantity": o.get("closed_quantity", o.get("quantity")),
                     "option_entry": o.get("option_entry"),
                     "option_exit": o.get("option_exit"),
                     "pnl": o.get("pnl"),

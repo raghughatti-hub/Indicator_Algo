@@ -1,3 +1,19 @@
+const voiceToggle = document.querySelector("#voiceToggle");
+async function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  const token = sessionStorage.getItem("control_api_token");
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  let response = await fetch(url, {...options, headers});
+  if (response.status === 401 && !token) {
+    const supplied = window.prompt("Enter the CONTROL_API_TOKEN configured on this server:");
+    if (supplied) {
+      sessionStorage.setItem("control_api_token", supplied);
+      headers.set("Authorization", `Bearer ${supplied}`);
+      response = await fetch(url, {...options, headers});
+    }
+  }
+  return response;
+}
 // ==============================================================================
 // === SECTION 1: GLOBAL SELECTIONS & STATE CONSTANTS ===
 // ==============================================================================
@@ -142,14 +158,19 @@ function announceOrderEvents(orders) {
     const previous = announcedOrders.get(key) || {};
     const current = {
       status: o.status,
+      quantity: Number(o.quantity || 0),
+      executionAlert: o.execution_alert || "",
       entryId: o.entry_order_id || "",
       exitId: o.exit_order_id || "",
       stoploss: o.stoploss,
       exit: o.option_exit,
     };
     
+    if (current.executionAlert && current.executionAlert !== previous.executionAlert) {
+      speakAlert(`${optionLabel(o)}: ${current.executionAlert}. Remaining quantity ${current.quantity}.`);
+    }
     // Announce entries
-    if (!previous.entryAnnounced && (current.entryId || current.status === "Active")) {
+    if (!previous.entryAnnounced && current.quantity > 0) {
       speakAlert(`Entry of ${optionLabel(o)} at ${money(o.option_entry)}. ${statusRemark(o)}`);
       current.entryAnnounced = true;
     } else {
@@ -158,8 +179,7 @@ function announceOrderEvents(orders) {
     
     // Announce exits
     const exitHappened = alreadySeen && (
-      (!previous.exitId && current.exitId) || 
-      (!previous.exit && current.exit) || 
+      (previous.quantity > current.quantity) ||
       (previous.status && previous.status !== "Closed" && current.status === "Closed")
     );
     if (exitHappened) {
@@ -288,7 +308,7 @@ function renderConnectionStatus(s, phase = "") {
   // Update notes if they mention broker
   const modeNote = document.querySelector("#modeNote");
   if (modeNote) {
-    modeNote.textContent = `Candles are fetched from ${brokerName}. Paper mode is default; live order placement uses the same order-management rules without sending broker orders.`;
+    modeNote.textContent = `Candles are fetched from ${brokerName}. Paper mode is default; Real mode sends broker orders when live trading is enabled.`;
   }
 
   // Update selected broker card highlight
@@ -650,7 +670,9 @@ function renderOrders(orders) {
     const opt = o.instrument_type === "Option" ? `${o.strike} ${o.option_type} ${o.strike_mode}` : o.instrument_type;
     const contract = escapeHtml(o.tradingsymbol || o.trade_contract?.tradingsymbol || "-");
     const entryRemarks = o.status === "Closed" && o.entry_remarks === "Paper entry active" ? "Paper entry closed" : (o.entry_remarks || o.quote_error);
-    const exitRemarks = o.exit_remarks || (o.status === "Closed" ? (o.exit_reason || "Closed") : "");
+    const exitRemarks = o.execution_alert || o.exit_remarks || (o.status === "Closed" ? (o.exit_reason || "Closed") : "");
+    const intentSummary = o.exit_intent || o.entry_intent;
+    const executionText = intentSummary ? `${intentSummary.state} | ${intentSummary.side === "BUY" ? "Max" : "Min"} ${money(intentSummary.boundary)}` : "";
     const remarks = o.exit_remarks || o.entry_remarks || o.quote_error || "";
     const statusTitle = remarks ? ` title="${escapeHtml(remarks)}"` : "";
     // Row class for dimming non-active orders (they stay visible for the intraday session)
@@ -673,7 +695,7 @@ function renderOrders(orders) {
       <td>${escapeHtml(o.entry_order_id || "-")}</td>
       <td>${escapeHtml(entryRemarks || "-")}</td>
       <td>${escapeHtml(o.exit_order_id || "-")}</td>
-      <td>${escapeHtml(exitRemarks || "-")}</td>
+      <td>${escapeHtml([exitRemarks, executionText].filter(Boolean).join(" | ") || "-")}</td>
       <td class="${pnlClass(o.pnl)}">${signedMoney(o.pnl)}</td>
     </tr>`;
   }).join("");
@@ -707,20 +729,21 @@ function clearLiveTables() {
 // ==============================================================================
 
 async function refreshStatus() {
-  const res = await fetch("/api/status");
+  const res = await apiFetch("/api/status");
   const json = await res.json();
   const s = json.data;
   renderConnectionStatus(s);
 }
 
 async function refreshRunner() {
-  const res = await fetch("/api/intraday/status");
+  const res = await apiFetch("/api/intraday/status");
   if (!res.ok) return;
   const json = await res.json();
   const data = json.data;
   const activeMode = data.trade_mode || tradeMode;
   
   runnerActive = Boolean(data.active);
+  document.querySelector("#stopRunner").textContent = data.entries_enabled ? "Pause entries" : "Entries paused";
   tradeMode = activeMode;
   const updateTime = timeOnly(data.last_order_update || data.last_update);
   
@@ -769,7 +792,7 @@ async function refreshOrdersOnly() {
   }
   _ordersAbortController = new AbortController();
   try {
-    const res = await fetch("/api/intraday/orders", { signal: _ordersAbortController.signal });
+    const res = await apiFetch("/api/intraday/orders", { signal: _ordersAbortController.signal });
     if (!res.ok) return;
     const json = await res.json();
     const data = json.data;
@@ -796,7 +819,7 @@ async function refreshOrdersOnly() {
 
 async function refreshIndexQuotes() {
   try {
-    const res = await fetch("/api/index-quotes");
+    const res = await apiFetch("/api/index-quotes");
     if (!res.ok) return;
     const json = await res.json();
     const quotes = json.data || [];
@@ -828,7 +851,7 @@ async function loadInstrumentMetadata() {
   
   try {
     const params = new URLSearchParams({ exchange, symbol, underlying });
-    const res = await fetch(`/api/instruments/metadata?${params.toString()}`);
+    const res = await apiFetch(`/api/instruments/metadata?${params.toString()}`);
     if (!res.ok) return;
     
     const json = await res.json();
@@ -855,7 +878,7 @@ async function loadInstrumentMetadata() {
 async function loadUnderlyingSuggestions() {
   const exchange = document.querySelector("#exchange").value;
   try {
-    const res = await fetch(`/api/instruments/underlyings?exchange=${exchange}`);
+    const res = await apiFetch(`/api/instruments/underlyings?exchange=${exchange}`);
     if (!res.ok) return;
     const json = await res.json();
     window.currentExchangeSymbols = json.data || [];
@@ -956,6 +979,17 @@ function runnerPayload() {
     entry_limit_price: entryLimitRaw === "" ? null : Number(entryLimitRaw),
     exit_order_mode: document.querySelector("#exitOrderMode").value,
     exit_limit_price: exitLimitRaw === "" ? null : Number(exitLimitRaw),
+    continuous_execution: true,
+    entry_slippage_pct: Number(document.querySelector("#entrySlippagePct").value),
+    exit_slippage_pct: Number(document.querySelector("#exitSlippagePct").value),
+    protective_exit_slippage_pct: Number(document.querySelector("#protectiveExitSlippagePct").value),
+    entry_slippage_points: document.querySelector("#entrySlippagePoints").value === "" ? null : Number(document.querySelector("#entrySlippagePoints").value),
+    exit_slippage_points: document.querySelector("#exitSlippagePoints").value === "" ? null : Number(document.querySelector("#exitSlippagePoints").value),
+    protective_exit_slippage_points: document.querySelector("#protectiveExitSlippagePoints").value === "" ? null : Number(document.querySelector("#protectiveExitSlippagePoints").value),
+    entry_timeout_seconds: Number(document.querySelector("#entryTimeoutSeconds").value),
+    max_entry_spread_pct: Number(document.querySelector("#maxEntrySpreadPct").value),
+    execution_reprice_seconds: Number(document.querySelector("#executionRepriceSeconds").value),
+    execution_max_attempts: Number(document.querySelector("#executionMaxAttempts").value),
     enable_price_chasing: document.querySelector("#enablePriceChasing").value === "YES",
     chase_max_retries: Number(document.querySelector("#chaseMaxRetries").value),
     chase_timeout_seconds: Number(document.querySelector("#chaseTimeoutSeconds").value),
@@ -1003,7 +1037,7 @@ function setTradeMode(mode) {
   document.querySelector("#startRunner").textContent = isReal ? "Start Real Algo" : "Start Paper Algo";
   document.querySelector("#ordersHeading").textContent = isReal ? "Real Orders" : "Paper Orders";
   document.querySelector("#modeNote").textContent = isReal
-    ? "Real Trade mode sends live Zebu limit orders only when LIVE_TRADING_ENABLED=true."
+    ? "Real Trade mode sends live broker limit orders only when LIVE_TRADING_ENABLED=true."
     : "Paper Trade mode follows the same order-management states locally.";
   renderModeBadge(mode, runnerActive);
   speakAlert(`Trade mode updated to ${isReal ? "Real Trade" : "Paper Trade"}.`);
@@ -1140,7 +1174,7 @@ document.querySelector("#submitAdjust").addEventListener("click", async () => {
   if (adjustTargetDirty) {
     payload.target = Number(tgtVal);
   }
-  const res = await fetch("/api/intraday/order-adjust", {
+  const res = await apiFetch("/api/intraday/order-adjust", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1186,7 +1220,7 @@ document.querySelector("#startRunner").addEventListener("click", async () => {
     alert("Enter underlying.");
     return;
   }
-  const res = await fetch("/api/intraday/start", {
+  const res = await apiFetch("/api/intraday/start", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1200,18 +1234,15 @@ document.querySelector("#startRunner").addEventListener("click", async () => {
 
 document.querySelector("#exitOpenOrder").addEventListener("click", async () => {
   enableVoiceAlerts();
-  const res = await fetch("/api/intraday/exit-open", { method: "POST" });
+  const res = await apiFetch("/api/intraday/exit-open", { method: "POST" });
   if (!res.ok) return showError(res);
   await refreshRunner();
 });
 
 document.querySelector("#stopRunner").addEventListener("click", async () => {
   enableVoiceAlerts();
-  const res = await fetch("/api/intraday/stop", { method: "POST" });
+  const res = await apiFetch("/api/intraday/stop", { method: "POST" });
   if (!res.ok) return showError(res);
-  if (runnerTimer) clearInterval(runnerTimer);
-  runnerTimer = null;
-  stopOrderTimer();
   await refreshRunner();
 });
 
@@ -1225,7 +1256,7 @@ document.querySelector("#checkConnection").addEventListener("click", async () =>
     connectionBadge.textContent = `DISCONNECTING FROM ${brokerName}...`;
     connectionBadge.classList.add("checking");
     try {
-      const res = await fetch("/api/disconnect", { method: "POST" });
+      const res = await apiFetch("/api/disconnect", { method: "POST" });
       if (res.ok) {
         if (loginStatusText) {
           loginStatusText.textContent = "";
@@ -1241,7 +1272,7 @@ document.querySelector("#checkConnection").addEventListener("click", async () =>
     connectionBadge.textContent = `${brokerName} CONNECTION NOT LIVE - checking...`;
     connectionBadge.classList.add("checking");
     
-    const res = await fetch("/api/connect", { 
+    const res = await apiFetch("/api/connect", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ broker: window.selectedBroker || "zebu" })
@@ -1266,7 +1297,7 @@ document.querySelector("#runZebu").addEventListener("click", async () => {
     interval: Number(document.querySelector("#timeframe").value),
   };
   
-  const res = await fetch("/api/bars/zebu", {
+  const res = await apiFetch("/api/bars/zebu", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
@@ -1413,7 +1444,7 @@ async function handleManualTrade(action) {
   if (sellBtn) sellBtn.disabled = true;
   
   try {
-    const res = await fetch("/api/intraday/manual-trade", {
+    const res = await apiFetch("/api/intraday/manual-trade", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1445,7 +1476,7 @@ async function handleCancelPendingManualTrade() {
   if (cancelBtn) cancelBtn.disabled = true;
   
   try {
-    const res = await fetch("/api/intraday/cancel-manual-trade", {
+    const res = await apiFetch("/api/intraday/cancel-manual-trade", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -1617,7 +1648,7 @@ if (loginSubmitBtn) {
     }
     loginSubmitBtn.disabled = true;
     try {
-      const res = await fetch("/api/connect", {
+      const res = await apiFetch("/api/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ broker: window.selectedBroker })
@@ -1682,3 +1713,9 @@ if (closeLandingBtn) {
 }
 
 appInitialized = true;
+
+document.querySelector("#reconcileOrders")?.addEventListener("click", async () => {
+  const response = await apiFetch("/api/intraday/reconcile", {method: "POST"});
+  if (!response.ok) return showError(response);
+  await refreshRunner();
+});

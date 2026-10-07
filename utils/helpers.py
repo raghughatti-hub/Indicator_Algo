@@ -1,28 +1,12 @@
+from utils.clock import market_time, EXCHANGE_TZ
 from datetime import datetime, time, timedelta
 from typing import Any
 
-NSE_OPEN = time(9, 15)
-NSE_CLOSE = time(15, 30)
-
-INDEX_DATA_SYMBOLS = {
-    "NIFTY": "NIFTY",
-    "NIFTY50": "NIFTY",
-    "NIFTY50-INDEX": "NIFTY",
-    "BANKNIFTY": "BANKNIFTY",
-    "FINNIFTY": "FINNIFTY",
-    "MIDCPNIFTY": "MIDCPNIFTY",
-    "SENSEX": "SENSEX",
-}
-
-DERIVATIVE_EXCHANGES = {"NFO", "BFO", "MCX", "CDS"}
-BSE_UNDERLYINGS = {"SENSEX", "BANKEX"}
-
-OPEN_ORDER_STATUSES = {"Idle", "Entry_Pending", "Active", "Exit_Pending"}
-ACTIVE_ORDER_STATUSES = {"Active", "Exit_Pending"}
-FINAL_ORDER_STATUSES = {"Entry_Rejected", "Closed", "QUOTE_ERROR"}
-
-PRODUCT_TYPE_MAP = {"MIS": "I", "NRML": "M"}
-TERMINAL_STATUS_SECONDS = 15
+from config.constants import (
+    NSE_OPEN, NSE_CLOSE, INDEX_DATA_SYMBOLS, DERIVATIVE_EXCHANGES, BSE_UNDERLYINGS,
+    OPEN_ORDER_STATUSES, ACTIVE_ORDER_STATUSES, FINAL_ORDER_STATUSES,
+    PRODUCT_TYPE_MAP, TERMINAL_STATUS_SECONDS,
+)
 
 
 def _adjust_strike(base: int, option_type: str, mode: str, steps: int, interval: int) -> int:
@@ -86,12 +70,13 @@ def _trade_exchange(exchange: str, symbol: str, underlying: str) -> str:
 
 def _today_session_start(now: datetime, start: time = NSE_OPEN) -> datetime:
     """Combine today's date with configured session start time."""
-    return datetime.combine(now.date(), start)
+    return datetime.combine(market_time(now).date(), start, EXCHANGE_TZ)
 
 
 def _is_market_time(now: datetime, start: time = NSE_OPEN, end: time = NSE_CLOSE) -> bool:
     """Check if current time falls within configured trading hours."""
-    return start <= now.time() <= end
+    now = market_time(now)
+    return now.weekday() < 5 and start <= now.time() <= end
 
 
 def _contract_name(contract: dict[str, Any] | None) -> str:

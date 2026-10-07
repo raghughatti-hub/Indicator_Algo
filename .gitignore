@@ -1,0 +1,12 @@
+# Local secrets and durable execution state
+.env
+creds.txt
+**/creds.txt
+**/*_Creds.txt
+.runtime/
+# Generated caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+orders.csv

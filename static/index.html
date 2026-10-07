@@ -403,6 +403,20 @@
           </label>
         </div>
         
+        <p class="note">Limit orders only. Point allowances override percentages. Exit boundaries never widen; an unfilled exit leaves exposure open.</p>
+        <div class="grid3 tight">
+          <label class="field"><span>Entry allowance %</span><input id="entrySlippagePct" type="number" value="0.3" min="0" step="0.05" /></label>
+          <label class="field"><span>Normal exit allowance %</span><input id="exitSlippagePct" type="number" value="0.3" min="0" step="0.05" /></label>
+          <label class="field"><span>SL / TSL allowance %</span><input id="protectiveExitSlippagePct" type="number" value="0.5" min="0" step="0.05" /></label>
+          <label class="field"><span>Entry allowance points (optional)</span><input id="entrySlippagePoints" type="number" value="" min="0" step="0.05" /></label>
+          <label class="field"><span>Normal exit points (optional)</span><input id="exitSlippagePoints" type="number" value="" min="0" step="0.05" /></label>
+          <label class="field"><span>SL / TSL points (optional)</span><input id="protectiveExitSlippagePoints" type="number" value="" min="0" step="0.05" /></label>
+          <label class="field"><span>Entry lifetime (seconds)</span><input id="entryTimeoutSeconds" type="number" value="10" min="0" step="0.05" /></label>
+          <label class="field"><span>Maximum entry spread %</span><input id="maxEntrySpreadPct" type="number" value="1" min="0" step="0.05" /></label>
+          <label class="field"><span>Order check interval (seconds)</span><input id="executionRepriceSeconds" type="number" value="1" min="0" step="0.05" /></label>
+          <label class="field"><span>Maximum submission attempts</span><input id="executionMaxAttempts" type="number" value="10" min="0" step="0.05" /></label>
+        </div>
+        <div hidden>
         <div class="grid2 tight">
           <label class="field">
             <span>Price Chasing</span>
@@ -435,7 +449,8 @@
           </label>
         </div>
         
-        <p class="note" id="modeNote">Candles are fetched from Zebu. Paper mode is default; live order placement uses the same order-management rules without sending broker orders.</p>
+        </div>
+        <p class="note" id="modeNote">Candles are fetched from Zebu. Paper mode is default; Real mode sends broker orders when live trading is enabled.</p>
 
         <div class="divider"></div>
         
@@ -518,7 +533,7 @@
             <h2>Summary</h2>
             <div class="summaryActions">
               <button id="startRunner" class="miniAction" type="button">Start Paper Algo</button>
-              <button id="stopRunner" class="miniAction secondary" type="button">Stop</button>
+              <button id="stopRunner" class="miniAction secondary" type="button">Pause entries</button> <button id="reconcileOrders" class="miniAction secondary" type="button">Reconcile orders</button>
               <button id="checkConnection" class="miniAction success" type="button">Login</button>
               <button id="runZebu" class="miniAction" type="button">Fetch Once</button>
             </div>

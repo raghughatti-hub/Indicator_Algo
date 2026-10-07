@@ -8,6 +8,7 @@ from urllib.parse import parse_qs, urlparse
 
 from config.settings import Settings, save_token_to_env
 from brokers.base import BaseBrokerClient
+from utils.http_transport import bound_sdk_http
 
 
 def patch_noren_websocket_backoff():
@@ -103,7 +104,7 @@ class ZebuClient(BaseBrokerClient):
             self.last_error = f"myntapi is not installed or importable: {exc}"
             return False
         try:
-            self.api = app_oauth()
+            self.api = bound_sdk_http(app_oauth())
             token = self.settings.zebu_access_token
             if token and hasattr(self.api, "set_session"):
                 self.api.set_session(userid=self.settings.zebu_user_id, password="", usertoken=token)
@@ -135,6 +136,8 @@ class ZebuClient(BaseBrokerClient):
         if not self.settings.zebu_user_id or not self.settings.zebu_password:
             self.last_error = "Zebu User ID/password missing in credentials"
             return False
+        oauth_state = self._begin_oauth()
+        callback_state = ""
         code_queue: Queue[str] = Queue()
         server = self._start_callback_server(code_queue)
         driver = None
@@ -144,10 +147,13 @@ class ZebuClient(BaseBrokerClient):
             from selenium.webdriver.support.ui import WebDriverWait  # type: ignore
             options = webdriver.ChromeOptions()
             options.add_argument("--window-size=1440,960")
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-dev-shm-usage")
             driver = webdriver.Chrome(options=options)
             wait = WebDriverWait(driver, 20)
             from selenium.common.exceptions import StaleElementReferenceException  # type: ignore
             auth_url = f"https://go.mynt.in/OAuthlogin/authorize/oauth?client_id={self.settings.zebu_client_id}"
+            auth_url += "&state=" + oauth_state
             driver.get(auth_url)
             filled_and_submitted = False
             for attempt in range(5):
@@ -185,15 +191,16 @@ class ZebuClient(BaseBrokerClient):
             while time.time() < deadline:
                 auth_code = self._extract_auth_code(driver.current_url)
                 if auth_code:
+                    callback_state = parse_qs(urlparse(driver.current_url).query).get("state", [""])[0]
                     break
                 if not code_queue.empty():
-                    auth_code = code_queue.get_nowait()
+                    auth_code, callback_state = code_queue.get_nowait()
                     break
                 time.sleep(1)
             if not auth_code:
                 self.last_error = "Timed out waiting for Zebu OAuth code."
                 return False
-            return self.connect_oauth_code(auth_code)
+            return self.connect_oauth_code(auth_code, state=callback_state)
         except Exception as exc:
             self.last_error = str(exc)
             return False
@@ -206,14 +213,16 @@ class ZebuClient(BaseBrokerClient):
                 except Exception:
                     pass
 
-    def connect_oauth_code(self, auth_code: str) -> bool:
+    def connect_oauth_code(self, auth_code: str, state: str = "") -> bool:
+        if not self._consume_oauth_state(state):
+            return False
         try:
             from myntapi import app_oauth  # type: ignore
         except Exception as exc:
             self.last_error = f"myntapi is not installed or importable: {exc}"
             return False
         try:
-            self.api = app_oauth()
+            self.api = bound_sdk_http(app_oauth())
             response = self.api.Oauth_login_using_code(
                 self.settings.zebu_client_id,
                 self.settings.zebu_api_secret,
@@ -268,7 +277,6 @@ class ZebuClient(BaseBrokerClient):
             "has_totp": bool(self.settings.zebu_totp_secret),
             "has_redirect_url": bool(self.settings.zebu_redirect_url),
             "has_access_token": bool(self.settings.zebu_access_token),
-            "session_token": self._session_token or self.settings.zebu_access_token or None,
             "last_error": self.last_error,
             "instrument_exchanges": sorted(self.instruments.frames.keys()),
         }
@@ -299,7 +307,7 @@ class ZebuClient(BaseBrokerClient):
             def do_GET(self) -> None:
                 code = ZebuClient._extract_auth_code(self.path)
                 if code:
-                    code_queue.put(code)
+                    code_queue.put((code, parse_qs(urlparse(self.path).query).get("state", [""])[0]))
                     body = b"<h2>Zebu login successful. You can close this tab.</h2>"
                 else:
                     body = b"<h2>Zebu callback received without code.</h2>"
@@ -344,6 +352,7 @@ class ZebuClient(BaseBrokerClient):
         print(f"[WS] Zebu WebSocket Error: {err}", flush=True)
 
     def _ws_callback_order_update(self, tick_data: dict[str, Any]) -> None:
+        self.publish_order_update(tick_data)
         order_id = tick_data.get("norenordno", "Unknown")
         status = tick_data.get("status", "Unknown")
         symbol = tick_data.get("tsym", "Unknown")
@@ -359,6 +368,8 @@ class ZebuClient(BaseBrokerClient):
             key = (exchange.upper(), str(token))
             if key not in self._ws_quotes:
                 self._ws_quotes[key] = {}
+            if "lp" in inmessage:
+                self._ws_quote_time[key] = time.monotonic()
             fields = ["lp", "pc", "o", "h", "l", "c", "bp1", "sp1", "v", "oi"]
             for field in fields:
                 if field in inmessage:

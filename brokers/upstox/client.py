@@ -1,3 +1,4 @@
+from utils.clock import market_now, market_time, candle_start
 from datetime import datetime, date, timedelta
 import gzip
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -50,7 +51,8 @@ class UpstoxClient(BaseBrokerClient):
         try:
             r = requests.get(url, headers=headers, timeout=5)
             if r.status_code == 200:
-                return True
+                self.verified_account_id = str(r.json().get("data", {}).get("user_id", ""))
+                return bool(self.verified_account_id)
             return False
         except Exception:
             return False
@@ -87,56 +89,17 @@ class UpstoxClient(BaseBrokerClient):
         if self.connected:
             return True
         if not self.settings.upstox_api_key or not self.settings.upstox_api_secret:
-            self.last_error = "Upstox API Key/Secret missing in credentials"
+            self.last_error = "Upstox API key and secret are required"
             return False
-        if not self.settings.upstox_mobile or not self.settings.upstox_pin or not self.settings.upstox_totp_secret:
-            self.last_error = "Upstox Mobile/PIN/TOTP missing in credentials"
-            return False
+        params = {"response_type": "code", "client_id": self.settings.upstox_api_key,
+                  "redirect_uri": self.settings.upstox_redirect_url or "http://localhost:8005/upstox/callback",
+                  "state": self._begin_oauth()}
+        self.last_error = "AUTH_REQUIRED:https://api.upstox.com/v2/login/authorization/dialog?" + urlencode(params)
+        return False
 
-        logger.info("[AUTH] Attempting automatic TOTP login refresh using local credentials...")
-        try:
-            from upstox_totp import UpstoxTOTP
-            
-            upx = UpstoxTOTP(
-                username=self.settings.upstox_mobile,
-                password="dummy",
-                pin_code=self.settings.upstox_pin,
-                totp_secret=self.settings.upstox_totp_secret,
-                client_id=self.settings.upstox_api_key,
-                client_secret=self.settings.upstox_api_secret,
-                redirect_uri=self.settings.upstox_redirect_url or "http://localhost:8005/upstox/callback"
-            )
-            response = upx.app_token.get_access_token()
-            if response.success and response.data:
-                access_token = response.data.access_token
-                
-                self.connected = True
-                self._session_token = access_token
-                self._quote_cache = {}
-                self._quote_cache_time = {}
-                self._token_cache = {}
-                self.last_error = None
-                
-                # Persist Token to .env
-                try:
-                    save_token_to_env(access_token, "upstox")
-                    print(f"[AUTH] Upstox Access token saved to .env successfully.", flush=True)
-                except Exception as env_exc:
-                    print(f"[AUTH] Warning: could not save Upstox token: {env_exc}", flush=True)
-                    
-                self.ensure_instruments_daily()
-                self.start_websocket()
-                return True
-            else:
-                self.last_error = f"Upstox programmatic token error: {response}"
-                print(f"[AUTH] Programmatic login response failed: {response}", flush=True)
-                return False
-        except Exception as exc:
-            self.last_error = str(exc)
-            print(f"[AUTH] Programmatic login failed: {exc}", flush=True)
+    def connect_oauth_code(self, auth_code: str, state: str = "") -> bool:
+        if not self._consume_oauth_state(state):
             return False
-
-    def connect_oauth_code(self, auth_code: str) -> bool:
         try:
             url = "https://api.upstox.com/v2/login/authorization/token"
             headers = {
@@ -154,7 +117,7 @@ class UpstoxClient(BaseBrokerClient):
 
             r = requests.post(url, data=payload, headers=headers, timeout=15)
             if r.status_code != 200:
-                self.last_error = f"Upstox token API error: {r.status_code} - {r.text}"
+                self.last_error = f"Upstox token API returned HTTP {r.status_code}"
                 return False
 
             res_data = r.json()
@@ -163,8 +126,11 @@ class UpstoxClient(BaseBrokerClient):
                 self.last_error = "No access_token found in Upstox response"
                 return False
 
-            self.connected = True
             self._session_token = access_token
+            if not self._validate_token():
+                self.last_error = "Cannot verify authenticated Upstox account"
+                return False
+            self.connected = True
             self._quote_cache = {}
             self._quote_cache_time = {}
             self._token_cache = {}
@@ -197,7 +163,6 @@ class UpstoxClient(BaseBrokerClient):
             "has_totp": bool(self.settings.upstox_totp_secret),
             "has_redirect_url": bool(self.settings.upstox_redirect_url),
             "has_access_token": bool(self.settings.upstox_access_token),
-            "session_token": self._session_token or self.settings.upstox_access_token or None,
             "last_error": self.last_error,
             "instrument_exchanges": sorted(self.instruments.frames.keys()) + (["UPSTOX"] if self.upstox_key_map else []),
         }
@@ -281,8 +246,8 @@ class UpstoxClient(BaseBrokerClient):
         if not target_path.exists():
             needs_download = True
         else:
-            mtime = datetime.fromtimestamp(os.path.getmtime(target_path))
-            if datetime.now() - mtime > timedelta(days=1):
+            mtime = datetime.fromtimestamp(os.path.getmtime(target_path), market_now().tzinfo)
+            if market_now() - mtime > timedelta(days=1):
                 needs_download = True
 
         if needs_download:
@@ -355,7 +320,10 @@ class UpstoxClient(BaseBrokerClient):
                     if tok.endswith('.0'):
                         tok = tok[:-2]
                     token_map[ikey] = tok
-                    token_to_key[tok] = ikey
+                    segment = ikey.split("|")[0]
+                    exchange = {"NSE_EQ":"NSE","NSE_FO":"NFO","BSE_EQ":"BSE","BSE_FO":"BFO","NSE_INDEX":"NSE","BSE_INDEX":"BSE","MCX_FO":"MCX","NSE_CD":"CDS"}.get(segment)
+                    if exchange:
+                        token_to_key[f"{exchange}|{tok}"] = ikey
                 if tsym.endswith('FUT'):
                     alt_f = tsym[:-3] + 'F'
                     key_map[alt_f] = ikey
@@ -369,13 +337,21 @@ class UpstoxClient(BaseBrokerClient):
             logger.error(f"Failed loading upstox_instruments.csv: {e}")
 
     def shoonya_to_upstox_key(self, token: str) -> Optional[str]:
+        indices = {"NSE|26000": "NSE_INDEX|Nifty 50", "NSE|26009": "NSE_INDEX|Nifty Bank",
+                   "NSE|26037": "NSE_INDEX|Nifty Fin Services", "NSE|26074": "NSE_INDEX|NIFTY MID SELECT",
+                   "NSE|26017": "NSE_INDEX|India VIX", "BSE|1": "BSE_INDEX|SENSEX", "BSE|12": "BSE_INDEX|BANKEX"}
+        if token in indices:
+            return indices[token]
+        if token in self.upstox_token_to_key:
+            return self.upstox_token_to_key[token]
         s = token.split('|')[-1].upper().strip()
         if not s:
             return None
         
         # Check token-to-key lookup (if s is numeric token)
-        if s in self.upstox_token_to_key:
-            return self.upstox_token_to_key[s]
+        if s.isdigit():
+            matches={key for ex_token,key in self.upstox_token_to_key.items() if ex_token.endswith("|"+s)}
+            return next(iter(matches)) if len(matches)==1 else None
             
         # Hardcoded index mappings
         if s in {"NIFTY 50", "NIFTY_50", "NIFTY"}:
@@ -385,7 +361,7 @@ class UpstoxClient(BaseBrokerClient):
         if s in {"NIFTY FIN SERVICES", "FINNIFTY"}:
             return "NSE_INDEX|Nifty Fin Services"
         if s in {"MIDCPNIFTY", "NIFTY MIDCAP 50"}:
-            return "NSE_INDEX|Nifty Midcap 50"
+            return "NSE_INDEX|NIFTY MID SELECT"
         if s in {"SENSEX", "BSESN"}:
             return "BSE_INDEX|SENSEX"
 
@@ -434,7 +410,6 @@ class UpstoxClient(BaseBrokerClient):
             if not hasattr(upstox_client, 'MarketDataStreamerV3'):
                 return
 
-            self._ws_feed_opened = True
             
             # Setup configuration
             configuration = upstox_client.Configuration()
@@ -444,12 +419,15 @@ class UpstoxClient(BaseBrokerClient):
             upstox_keys = set()
             for key in self._ws_subscribed:
                 # key is exchange|token
-                token = key.split("|")[-1]
-                ikey = self.shoonya_to_upstox_key(token)
+                exchange, token = key.split("|", 1)
+                ikey = self.shoonya_to_upstox_key(f"{exchange}|{token}")
                 if ikey:
                     upstox_keys.add(ikey)
                     self.v3_key_to_req[ikey] = token
                     self.v3_key_to_req[ikey.replace("|", ":")] = token
+
+            def on_open():
+                self._ws_feed_opened = True
 
             def on_message(message):
                 try:
@@ -506,6 +484,7 @@ class UpstoxClient(BaseBrokerClient):
                                 "ti": 0.05
                             }
                             self._ws_quotes[cache_key] = quote_dict
+                            self._ws_quote_time[cache_key] = time.monotonic()
                 except Exception as ex:
                     logger.debug(f"[WS MSG ERROR] {ex}")
 
@@ -528,6 +507,7 @@ class UpstoxClient(BaseBrokerClient):
                 list(upstox_keys),
                 "ltpc"
             )
+            self.v3_streamer.on("open", on_open)
             self.v3_streamer.on("message", on_message)
             self.v3_streamer.on("error", on_error)
             self.v3_streamer.on("close", on_close)
@@ -548,11 +528,13 @@ class UpstoxClient(BaseBrokerClient):
 
     def subscribe_ws(self, exchange: str, token: str) -> bool:
         key = f"{exchange.upper()}|{token.strip()}"
+        if key in self._ws_subscribed:
+            return True
         self._ws_subscribed.add(key)
         
         # Subscribe dynamically if websocket running
         if self._ws_feed_opened and self.v3_streamer:
-            ikey = self.shoonya_to_upstox_key(token)
+            ikey = self.shoonya_to_upstox_key(f"{exchange}|{token}")
             if ikey:
                 self.v3_key_to_req[ikey] = token
                 self.v3_key_to_req[ikey.replace("|", ":")] = token
@@ -568,7 +550,7 @@ class UpstoxClient(BaseBrokerClient):
         if key in self._ws_subscribed:
             self._ws_subscribed.remove(key)
             if self._ws_feed_opened and self.v3_streamer:
-                ikey = self.shoonya_to_upstox_key(token)
+                ikey = self.shoonya_to_upstox_key(f"{exchange}|{token}")
                 if ikey:
                     try:
                         self.v3_streamer.unsubscribe([ikey])
@@ -594,12 +576,9 @@ class UpstoxClient(BaseBrokerClient):
         end: Optional[datetime] = None
     ) -> list[dict]:
         # Fetch historical candles from Upstox REST API
-        ikey = self.shoonya_to_upstox_key(symbol) or self.upstox_key_map.get(symbol.upper())
+        ikey = self.shoonya_to_upstox_key(f"{exchange}|{symbol}") or self.upstox_key_map.get(symbol.upper())
         if not ikey:
-            if exchange.upper() in ["NSE", "BSE"]:
-                ikey = f"NSE_EQ|{symbol}"
-            else:
-                ikey = f"NSE_FO|{symbol}"
+            raise RuntimeError("Exact Upstox historical instrument key unavailable")
 
         import urllib.parse
         safe_ikey = urllib.parse.quote(ikey)
@@ -609,27 +588,30 @@ class UpstoxClient(BaseBrokerClient):
         need_resample = False
         if interval in (1, 30):
             interval_name = "1minute" if interval == 1 else "30minute"
-        elif interval >= 375:
-            interval_name = "day"
         else:
             interval_name = "1minute"
             need_resample = True
 
-        end_date = end or datetime.now()
+        end_date = end or market_now()
         start_date = start or (end_date - timedelta(days=10))
 
         end_str = end_date.strftime("%Y-%m-%d")
         start_str = start_date.strftime("%Y-%m-%d")
 
-        url = f"https://api.upstox.com/v2/historical-candle/{safe_ikey}/{interval_name}/{end_str}/{start_str}"
-        headers = {"Accept": "application/json"}
-        
-        r = requests.get(url, headers=headers, timeout=10)
-        if r.status_code != 200:
-            return []
-
-        res_data = r.json()
-        candles = res_data.get("data", {}).get("candles", [])
+        today = market_now().date()
+        headers = {"Accept": "application/json", "Authorization": f"Bearer {self._session_token}"}
+        candles = []
+        history_end = min(market_time(end_date).date(), today - timedelta(days=1))
+        if market_time(start_date).date() <= history_end:
+            url = f"https://api.upstox.com/v2/historical-candle/{safe_ikey}/{interval_name}/{history_end.isoformat()}/{start_str}"
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            candles.extend(response.json().get("data", {}).get("candles", []))
+        if market_time(start_date).date() <= today <= market_time(end_date).date():
+            url = f"https://api.upstox.com/v2/historical-candle/intraday/{safe_ikey}/{interval_name}"
+            response = requests.get(url, headers=headers, timeout=10)
+            response.raise_for_status()
+            candles.extend(response.json().get("data", {}).get("candles", []))
         if not candles:
             return []
 
@@ -641,7 +623,7 @@ class UpstoxClient(BaseBrokerClient):
                 df_raw = df_raw.set_index("time").sort_index()
 
                 resampler_rule = f"{interval}min"
-                df_resampled = df_raw.resample(resampler_rule).agg({
+                df_resampled = df_raw.resample(resampler_rule, origin="start_day", offset="9h15min").agg({
                     "open": "first",
                     "high": "max",
                     "low": "min",
@@ -652,7 +634,7 @@ class UpstoxClient(BaseBrokerClient):
                 bars = []
                 for ts, row in df_resampled.iterrows():
                     bars.append({
-                        "time": ts.to_pydatetime(),
+                        "time": market_time(ts.to_pydatetime()),
                         "open": float(row["open"]),
                         "high": float(row["high"]),
                         "low": float(row["low"]),
@@ -668,9 +650,9 @@ class UpstoxClient(BaseBrokerClient):
         for c in reversed(candles):
             ts_str = c[0]
             try:
-                dt_obj = pd.to_datetime(ts_str).to_pydatetime()
+                dt_obj = market_time(pd.to_datetime(ts_str).to_pydatetime())
             except Exception:
-                dt_obj = datetime.now()
+                dt_obj = market_now()
 
             bars.append({
                 "time": dt_obj,
@@ -683,20 +665,19 @@ class UpstoxClient(BaseBrokerClient):
         return sorted(bars, key=lambda r: r["time"])
 
     def get_quote(self, exchange: str, token: str, bypass_cache: bool = False) -> dict:
+        self.ensure_connected()
+        self.subscribe_ws(exchange,token)
         # Check cache/websocket first
         exch = exchange.upper()
         cache_key = (exch, token.strip())
         
         if not bypass_cache and self._ws_feed_opened:
-            if cache_key in self._ws_quotes:
+            if cache_key in self._ws_quotes and time.monotonic()-self._ws_quote_time.get(cache_key,0)<=self.max_quote_age:
                 return self._ws_quotes[cache_key]
 
-        ikey = self.shoonya_to_upstox_key(token) or self.upstox_token_to_key.get(token.strip())
+        ikey = self.shoonya_to_upstox_key(f"{exch}|{token}")
         if not ikey:
-            if exch in ["NSE", "BSE"]:
-                ikey = f"NSE_EQ|{token}"
-            else:
-                ikey = f"NSE_FO|{token}"
+            raise RuntimeError("Exact Upstox quote instrument key unavailable")
 
         req_key = ikey.replace("|", ":")
         url = f"https://api.upstox.com/v2/market-quote/quotes?instrument_key={req_key}"
@@ -740,6 +721,7 @@ class UpstoxClient(BaseBrokerClient):
         
         # Populate cache
         self._ws_quotes[cache_key] = mapped_quote
+        self._ws_quote_time[cache_key] = time.monotonic()
         return mapped_quote
 
     def place_order(
@@ -753,8 +735,13 @@ class UpstoxClient(BaseBrokerClient):
         price_type: str,
         price: float,
         trigger_price: Optional[float] = None,
-        confirm_live: bool = False
+        confirm_live: bool = False,
+        client_order_id: str | None = None
     ) -> dict:
+        if price_type != "LMT":
+            raise ValueError("Only LIMIT orders are supported for algo execution")
+        if price <= 0 or quantity <= 0:
+            raise ValueError("Limit price and quantity must be positive")
         is_paper = not (confirm_live and self.settings.live_trading_enabled)
         if is_paper:
             # Paper execution
@@ -770,10 +757,7 @@ class UpstoxClient(BaseBrokerClient):
         # Live execution
         ikey = self.shoonya_to_upstox_key(tradingsymbol)
         if not ikey:
-            if exchange.upper() in ["NSE", "BSE"]:
-                ikey = f"NSE_EQ|{tradingsymbol}"
-            else:
-                ikey = f"NSE_FO|{tradingsymbol}"
+            raise RuntimeError("Exact Upstox order instrument key unavailable")
 
         url = "https://api.upstox.com/v2/order/place"
         headers = {
@@ -783,15 +767,17 @@ class UpstoxClient(BaseBrokerClient):
         }
 
         # product: "I" if MIS ("M"), "D" if CNC/NRML ("C")
-        product = "I" if product_type == "M" else "D"
-        order_type = "LIMIT" if price_type == "LMT" else "MARKET"
+        if product_type not in {"I", "M", "D"}:
+            raise ValueError("Unsupported product type")
+        product = "I" if product_type == "I" else "D"
+        order_type = "LIMIT"
 
         payload = {
             "quantity": quantity,
             "product": product,
             "validity": "DAY",
             "price": price,
-            "tag": "TVIndicatorAlgo",
+            "tag": client_order_id or "TVIndicatorAlgo",
             "instrument_token": ikey,
             "order_type": order_type,
             "transaction_type": side.upper(),
@@ -854,7 +840,7 @@ class UpstoxClient(BaseBrokerClient):
 
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
-            return []
+            raise RuntimeError(f"Upstox read failed: HTTP {r.status_code}")
 
         res_json = r.json()
         orders = res_json.get("data", [])
@@ -879,6 +865,7 @@ class UpstoxClient(BaseBrokerClient):
                 "orderno": order_id,
                 "order_id": order_id,
                 "status": status,
+                "remarks": o.get("tag"),
                 "rejreason": o.get("status_message") or "",
                 "avgprc": str(o.get("average_price", 0.0)),
                 "flqty": str(o.get("filled_quantity", 0)),
@@ -898,7 +885,7 @@ class UpstoxClient(BaseBrokerClient):
 
         r = requests.get(url, headers=headers, timeout=10)
         if r.status_code != 200:
-            return []
+            raise RuntimeError(f"Upstox read failed: HTTP {r.status_code}")
 
         res_json = r.json()
         positions = res_json.get("data", [])
@@ -908,6 +895,7 @@ class UpstoxClient(BaseBrokerClient):
         mapped_positions = []
         for p in positions:
             mapped_positions.append({
+                "exch": p.get("exchange"),
                 "tsym": p.get("tradingsymbol"),
                 "prd": "M" if p.get("product") == "D" else "I",
                 "netqty": str(p.get("quantity", 0)),
@@ -961,94 +949,19 @@ class UpstoxClient(BaseBrokerClient):
 
 
 def start_persistent_callback_server() -> None:
-    # Persistent HTTP server on port 8090 to capture Upstox OAuth callback code
-    class PersistentHandler(BaseHTTPRequestHandler):
-        def do_GET(self) -> None:
-            code = UpstoxClient._extract_request_code(self.path)
-            if code:
-                # Exchange auth code on the active client in background
-                success = False
-                err_msg = ""
-                try:
-                    # Trigger connection exchange on main uvicorn process env
-                    url = "https://api.upstox.com/v2/login/authorization/token"
-                    headers = {
-                        "Accept": "application/json",
-                        "Content-Type": "application/x-www-form-urlencoded"
-                    }
-                    
-                    # Read config to get keys
-                    from config.settings import reload_settings
-                    current_settings = reload_settings()
-                    
-                    payload = {
-                        "code": code,
-                        "client_id": current_settings.upstox_api_key,
-                        "client_secret": current_settings.upstox_api_secret,
-                        "redirect_uri": current_settings.upstox_redirect_url or "http://localhost:8005/upstox/callback",
-                        "grant_type": "authorization_code"
-                    }
-
-                    r = requests.post(url, data=payload, headers=headers, timeout=15)
-                    if r.status_code == 200:
-                        res_data = r.json()
-                        access_token = res_data.get("access_token")
-                        if access_token:
-                            save_token_to_env(access_token, "upstox")
-                            success = True
-                        else:
-                            err_msg = "No access token in response"
-                    else:
-                        err_msg = f"HTTP {r.status_code} - {r.text}"
-                except Exception as ex:
-                    err_msg = str(ex)
-
-                if success:
-                    body = """
-                    <html>
-                    <head><title>Upstox Login Successful</title></head>
-                    <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                        <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #e6f4ea;">
-                            <h2 style="color: #137333;">&#10003; Upstox Login Successful!</h2>
-                            <p>Stored tokens updated successfully in environment.</p>
-                            <p>You can close this tab and return to your Trade Terminal on port 8005.</p>
-                            <script>
-                                setTimeout(function() {
-                                    window.location.href = "http://localhost:8005/";
-                                }, 3000);
-                            </script>
-                        </div>
-                    </body>
-                    </html>
-                    """.encode("utf-8")
-                else:
-                    body = f"""
-                    <html>
-                    <head><title>Upstox Login Failed</title></head>
-                    <body style="font-family: sans-serif; text-align: center; padding-top: 50px;">
-                        <div style="display: inline-block; padding: 30px; border: 1px solid #ccc; border-radius: 8px; background: #fce8e6;">
-                            <h2 style="color: #c5221f;">&#10060; Upstox Login Failed</h2>
-                            <p>Error exchanging authentication code: {err_msg}</p>
-                            <p>Please check your API key, secret, and console settings.</p>
-                        </div>
-                    </body>
-                    </html>
-                    """.encode()
-            else:
-                body = b"<h2>Upstox callback received without auth code.</h2>"
-                
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html")
-            self.send_header("Content-Length", str(len(body)))
+    """Bridge registered loopback redirects to the state-validating main callback."""
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            query = parse_qs(urlparse(self.path).query)
+            values = {k: query[k][0] for k in ("code", "state", "error") if k in query}
+            self.send_response(302)
+            self.send_header("Location", "http://localhost:8005/upstox/callback?" + urlencode(values))
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, *_: Any) -> None:
-            return
-
+        def log_message(self, *_):
+            pass
     try:
-        server = HTTPServer(('127.0.0.1', 8090), PersistentHandler)
+        server = HTTPServer(("127.0.0.1", 8090), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        print("[UPSTOX] Persistent callback server started on port 8090.", flush=True)
-    except Exception as e:
-        print(f"[UPSTOX WARNING] Could not start persistent callback server on port 8090: {e}", flush=True)
+    except OSError:
+        logger.warning("Optional OAuth redirect bridge port 8090 is unavailable")

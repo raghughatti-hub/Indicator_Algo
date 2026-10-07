@@ -1,6 +1,6 @@
 # config/constants.py
 # Shared application-level constants. Grouped here for a single authoritative source.
-# These values are also present in utils/helpers.py for backward-compatibility.
+# Compatibility helpers import these values.
 from datetime import time
 
 # ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ BSE_UNDERLYINGS = {"SENSEX", "BANKEX"}
 # ---------------------------------------------------------------------------
 # Order status sets
 # ---------------------------------------------------------------------------
-OPEN_ORDER_STATUSES = {"Idle", "Entry_Pending", "Active", "Exit_Pending"}
+OPEN_ORDER_STATUSES = {"Idle", "Entry_Submitting", "Entry_Pending", "Active", "Exit_Submitting", "Exit_Pending", "Recovery_Required"}
 ACTIVE_ORDER_STATUSES = {"Active", "Exit_Pending"}
 FINAL_ORDER_STATUSES = {"Entry_Rejected", "Closed", "QUOTE_ERROR"}
 

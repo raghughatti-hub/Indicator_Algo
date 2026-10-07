@@ -1,4 +1,5 @@
 from __future__ import annotations
+from utils.clock import market_now, market_time, candle_start
 
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -107,10 +108,10 @@ class InstrumentMaster:
     def ensure_daily(self, exchanges: tuple[str, ...] = EXCHANGES) -> None:
         """Download missing or outdated symbols files from Shoonya API for current day."""
         self.folder.mkdir(exist_ok=True)
-        today = date.today()
+        today = market_now().date()
         for exchange in exchanges:
             path = self.folder / f"{exchange}_symbols.csv"
-            if path.exists() and datetime.fromtimestamp(path.stat().st_mtime).date() == today:
+            if path.exists() and datetime.fromtimestamp(path.stat().st_mtime, market_now().tzinfo).date() == today:
                 if exchange not in self.frames:
                     self.frames[exchange] = self._read_csv(path, exchange)
                 continue
@@ -210,7 +211,7 @@ class InstrumentMaster:
         expiries = sorted(raw_expiries, key=_sort_key)
         
         # Select the nearest upcoming expiry (or fallback to soonest available)
-        today = date.today()
+        today = market_now().date()
         upcoming = [e for e in expiries if _sort_key(e).date() >= today]
         default_expiry = upcoming[0] if upcoming else (expiries[0] if expiries else "")
         
@@ -235,7 +236,7 @@ class InstrumentMaster:
 
     def resolve_future(self, underlying: str, exchange: str, expiry: str = "CURRENT_MONTH") -> dict[str, Any] | None:
         """Find the matching future contract row from cached exchange masters."""
-        df = self._filtered(exchange, "Future", underlying, "CURRENT_MONTH")
+        df = self._filtered(exchange, "Future", underlying, expiry)
         if "Instrument" in df.columns:
             df = df[df["Instrument"].isin(["FUTIDX", "FUTSTK", "FUTCUR", "FUTCOM"])]
         row = self._first_expiry_row(df)
@@ -262,6 +263,8 @@ class InstrumentMaster:
         if df is None or df.empty:
             return pd.DataFrame()
         result = df.copy()
+        if "_ExpiryDate" in result and symbol in {"Option", "Future"}:
+            result = result[result["_ExpiryDate"].dt.date >= market_now().date()]
         clean = underlying.strip().upper()
         
         if "Symbol" in result.columns:
@@ -273,8 +276,9 @@ class InstrumentMaster:
             
         if expiry and expiry not in {"CURRENT_WEEK", "CURRENT_MONTH"}:
             wanted = _expiry_text(expiry)
-            if wanted:
-                result = result[result["ExpiryText"] == wanted]
+            if not wanted:
+                raise ValueError("Invalid expiry date")
+            result = result[result["ExpiryText"] == wanted]
         return result
 
     def _first_expiry_row(self, df: pd.DataFrame) -> pd.Series | None:
