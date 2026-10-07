@@ -117,13 +117,13 @@ DEFAULT_QUANTITY=1
 ### creds.txt
 
 ```text
-Vendor code	Z50011
-Password:	Ragram@312
-TOTP :		5757XV35F4L7PG6246C6AT5VX2O2R546
-API key : 	tAWUq655s6zmu65cDUuB3m277ca2CeRn
-API Secret:	nQF2tQgypa3gwCOj8b4dFxiymj22pxhA
+Vendor code	
+Password:	
+TOTP :		
+API key : 	
+API Secret:	
 redirectURL: 	http://127.0.0.1:5000/zebu/callback
-Client_Id:	Z50011_U
+Client_Id:	
 
 
 
