@@ -35,7 +35,7 @@ from models.schemas import (
 )
 from strategy.engine import run_strategy, normalize_bars
 from brokers.base import BaseBrokerClient
-from utils.security import authorized, local_browser, same_origin, control_token, runtime_dir
+from utils.security import authorized, local_browser, dashboard_access_allowed, control_token, runtime_dir
 from html import escape
 
 # ==============================================================================
@@ -83,7 +83,7 @@ app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
-    if not same_origin(request):
+    if not dashboard_access_allowed(request):
         raise HTTPException(status_code=403,detail="Cross-origin control access denied")
     response=HTMLResponse((BASE_DIR/"static"/"index.html").read_text(encoding="utf-8"))
     if local_browser(request):

@@ -53,6 +53,22 @@ def same_origin(request) -> bool:
     return True
 
 
+def dashboard_access_allowed(request) -> bool:
+    """Allow direct dashboard links, without relaxing control API authentication.
+
+    Fetch Metadata identifies a top-level document navigation; cross-site fetches
+    and embedded frames must still fail the origin check.
+    """
+    if same_origin(request):
+        return True
+    return (
+        request.method == "GET"
+        and request.headers.get("sec-fetch-mode") == "navigate"
+        and request.headers.get("sec-fetch-dest") == "document"
+        and not request.headers.get("origin")
+    )
+
+
 def authorized(request) -> bool:
     if not same_origin(request):
         return False

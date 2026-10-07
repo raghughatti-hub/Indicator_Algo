@@ -118,3 +118,23 @@ class SecurityTests(unittest.TestCase):
             self.assertTrue(r.recovery_required)
             with self.assertRaises(RuntimeError):r._persist_state()
             self.assertEqual(path.read_text(),'broken')
+
+    def test_dashboard_cross_site_top_level_navigation_allowed(self):
+        from utils.security import dashboard_access_allowed
+        r=request(headers={'sec-fetch-site':'cross-site','sec-fetch-mode':'navigate','sec-fetch-dest':'document'})
+        r.method='GET'
+        self.assertTrue(dashboard_access_allowed(r))
+        with patch.dict(os.environ,{'CONTROL_API_TOKEN':'x'*32},clear=True):
+            r.cookies={'algo_session':'x'*32}
+            self.assertFalse(authorized(r))
+    def test_dashboard_cross_site_fetch_frame_and_post_rejected(self):
+        from utils.security import dashboard_access_allowed
+        for mode,dest,method in [('cors','empty','GET'),('navigate','iframe','GET'),('navigate','document','POST')]:
+            r=request(headers={'sec-fetch-site':'cross-site','sec-fetch-mode':mode,'sec-fetch-dest':dest})
+            r.method=method
+            self.assertFalse(dashboard_access_allowed(r))
+    def test_dashboard_explicit_foreign_origin_rejected(self):
+        from utils.security import dashboard_access_allowed
+        r=request(headers={'origin':'http://evil.example','sec-fetch-mode':'navigate','sec-fetch-dest':'document'})
+        r.method='GET'
+        self.assertFalse(dashboard_access_allowed(r))
