@@ -1,0 +1,680 @@
+<!doctype html>
+<!--
+================================================================================
+=== WEB INTERFACE: NSE TOOLS PYTHON ALGO ===
+=== Structuring controls, metrics, charts, orders, and signals into a premium interface.
+================================================================================
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NSE Tools Python Algo</title>
+    <!-- Cache-busting static asset reference -->
+    <link rel="stylesheet" href="/static/styles.css?v=40" />
+  </head>
+  <body>
+
+    <!--
+    ============================================================================
+    === WELCOME LANDING PAGE (BROKER SELECT & LOGIN) ===
+    ============================================================================
+    -->
+    <div id="landingPage" class="landingPage" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: radial-gradient(circle at center, #1b263b 0%, #0d1b2a 100%); display: flex; justify-content: center; align-items: center; z-index: 9999;">
+      <div class="landingCard">
+        <button id="closeLandingBtn" class="closeLandingBtn" type="button" title="Dismiss login panel">&times;</button>
+        <div class="landingHeader">
+          <svg class="landingLogo" viewBox="0 0 24 24" width="48" height="48" style="color: #4684c6; margin-bottom: 12px;">
+            <path fill="currentColor" d="M12 2L2 22h20L12 2zm0 4l6.5 13H5.5L12 6z"/>
+          </svg>
+          <h2>Trade Terminal</h2>
+          <p>Please select a broker and establish a live session to launch the algo dashboard.</p>
+        </div>
+        
+        <div class="brokerGrid">
+          <div class="brokerCard active" data-broker="zebu" id="brokerCardZebu">
+            <div class="brokerIcon">Z</div>
+            <h3>Zebu Login</h3>
+            <p>Connect with Zebu API</p>
+          </div>
+          <div class="brokerCard" data-broker="flattrade" id="brokerCardFlattrade">
+            <div class="brokerIcon">F</div>
+            <h3>FlatTrade Login</h3>
+            <p>Connect with FlatTrade API</p>
+          </div>
+          <div class="brokerCard" data-broker="upstox" id="brokerCardUpstox">
+            <div class="brokerIcon">U</div>
+            <h3>Upstox Login</h3>
+            <p>Connect with Upstox API</p>
+          </div>
+        </div>
+        
+        <div class="loginActionRow">
+          <button id="loginSubmitBtn" class="loginSubmitBtn" type="button">Connect & Proceed</button>
+        </div>
+        
+        <div id="loginStatusText" class="loginStatusText"></div>
+      </div>
+    </div>
+
+    <!--
+    ============================================================================
+    === SECTION 1: TOP NAVIGATION & SYSTEM STATUS BAR ===
+    === Branding, mode controls (Paper vs Real), voice triggers, and live quote strips.
+    ============================================================================
+    -->
+    <header class="topbar">
+      <div>
+        <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 8px;">
+          <h1 style="margin: 0;">NSE Tools Python Algo</h1>
+          <button id="homeBtn" class="miniAction secondary" type="button" style="width: auto; height: 28px; padding: 0 14px; margin: 0; font-size: 11px;">Home</button>
+        </div>
+        <p style="margin: 0;">Raghu signals, ADX confirmation, targets, trailing stop and Zebu-ready execution.</p>
+      </div>
+      
+      <div class="topCenter">
+        <div class="modeControls">
+          <!-- Trade execution mode selection -->
+          <div class="tradeToggle" aria-label="Trade mode">
+            <button id="paperMode" class="modeButton active" type="button">Paper Trade</button>
+            <button id="realMode" class="modeButton" type="button">Real Trade</button>
+          </div>
+          <!-- Master switch for HTML5 browser voice synthesis notifications -->
+          <button id="voiceToggle" class="voiceToggle off" type="button" aria-label="Voice alerts off" title="Voice alerts off">
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M3 9v6h4l5 4V5L7 9H3z"></path>
+              <path class="voiceWave" d="M16 8c1.4 1.1 2 2.5 2 4s-.6 2.9-2 4"></path>
+              <path class="voiceWave" d="M18.5 5.5C21 7.5 22 9.7 22 12s-1 4.5-3.5 6.5"></path>
+              <path class="voiceMute" d="M16 9l5 5m0-5l-5 5"></path>
+            </svg>
+          </button>
+          <!-- Theme toggle button (Dark / Light mode) -->
+          <button id="themeToggleBtn" class="miniAction secondary" type="button" style="width: auto; height: 36px; padding: 0 12px; margin: 0; font-size: 13px; display: flex; align-items: center; gap: 6px;" title="Toggle Light / Dark mode">
+            <span id="themeToggleIcon">🌙</span> <span id="themeToggleText">Dark</span>
+          </button>
+        </div>
+        
+        <!-- Live NIFTY / BANKNIFTY index price ticker feed -->
+        <div class="quoteStrip" id="quoteStrip">
+          <span>
+            NIFTY <strong id="niftyQuote">-</strong>
+            <em id="niftyChange">-</em>
+          </span>
+          <span>
+            BANKNIFTY <strong id="bankniftyQuote">-</strong>
+            <em id="bankniftyChange">-</em>
+          </span>
+          <span>
+            SENSEX <strong id="sensexQuote">-</strong>
+            <em id="sensexChange">-</em>
+          </span>
+          <span>
+            BANKEX <strong id="bankexQuote">-</strong>
+            <em id="bankexChange">-</em>
+          </span>
+        </div>
+      </div>
+      
+      <div class="statusBox">
+        <div class="statusRow">
+          <!-- Local state badge and broker connectivity health badge -->
+          <div class="modeBadge paper stopped" id="modeBadge">PAPER TRADE STOPPED</div>
+          <div class="connectionBadge checking" id="connectionBadge">Checking connection...</div>
+        </div>
+        <div class="status" id="status">Checking...</div>
+      </div>
+    </header>
+
+    <!--
+    ============================================================================
+    === MAIN APPLICATION LAYOUT SECTION ===
+    ============================================================================
+    -->
+    <main class="layout">
+
+      <!--
+      ==========================================================================
+      === SECTION 2: SIDEBAR PARAMETER SETTINGS PANEL ===
+      === Input controls for instruments, risk thresholds, stoploss trailing and calculations.
+      ==========================================================================
+      -->
+      <section class="panel controls">
+        <h2>Intraday Runner</h2>
+        
+        <!-- Instrument & Scrip Selection -->
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Exchange</span>
+            <select id="exchange">
+              <option selected>NSE</option>
+              <option>BSE</option>
+              <option>NFO</option>
+              <option>BFO</option>
+              <option>MCX</option>
+              <option>CDS</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Underlying</span>
+            <input id="underlying" list="underlyings-list" value="NIFTY" />
+            <datalist id="underlyings-list"></datalist>
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Symbol</span>
+            <select id="symbol">
+              <option>Spot</option>
+              <option>Future</option>
+              <option selected>Option</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Expiry</span>
+            <select id="optionExpiry">
+              <option>CURRENT_WEEK</option>
+            </select>
+          </label>
+        </div>
+        
+        <!-- Strike details and spacing gaps -->
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Moneyness</span>
+            <select id="optionMoneyness">
+              <option value="0">ATM</option>
+              <option value="1">+1 OTM</option>
+              <option value="2">+2 OTM</option>
+              <option value="3">+3 OTM</option>
+              <option value="-1">-1 ITM</option>
+              <option value="-2">-2 ITM</option>
+              <option value="-3">-3 ITM</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Strike Gap</span>
+            <input id="strikeInterval" type="number" value="50" min="1" />
+          </label>
+          <label class="field">
+            <span>Tick Size</span>
+            <input id="tickSize" type="number" value="0.05" min="0.01" step="0.01" readonly />
+          </label>
+        </div>
+        
+        <!-- Directional filtering modes -->
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Signal Mode</span>
+            <select id="tradingMode">
+              <option>LONG_SHORT</option>
+              <option>LONG</option>
+              <option>SHORT</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Strategy</span>
+            <select id="optionStrategy">
+              <option>BUY</option>
+              <option>SELL</option>
+            </select>
+          </label>
+        </div>
+        
+        <!-- Sizing & Trade quantity specifications -->
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Lot Size</span>
+            <input id="lotSize" type="number" value="65" min="1" readonly />
+          </label>
+          <label class="field">
+            <span>Qty</span>
+            <input id="qty" type="number" value="65" min="1" readonly />
+          </label>
+          <label class="field">
+            <span>Lots to Trade</span>
+            <input id="optionQtyLots" type="number" value="1" min="1" />
+          </label>
+        </div>
+        
+        <!-- Financial boundaries / risk cutoffs -->
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Max Profit</span>
+            <input id="maxProfit" type="number" value="10000" />
+          </label>
+          <label class="field">
+            <span>Max Loss</span>
+            <input id="maxLoss" type="number" value="-10000" />
+          </label>
+        </div>
+        
+        <!-- Operations timing window -->
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Start Time</span>
+            <input id="startTime" value="09:15:00" />
+          </label>
+          <label class="field">
+            <span>Exit Time</span>
+            <input id="exitTime" value="15:15:00" />
+          </label>
+        </div>
+        
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Candle Timeframe</span>
+            <input id="timeframe" type="number" value="3" min="1" />
+          </label>
+          <label class="field">
+            <span>Max Trades Per Day</span>
+            <input id="maxTrades" type="number" value="11" min="1" />
+          </label>
+          <label class="field">
+            <span>Order Type</span>
+            <select id="orderProductType">
+              <option>NRML</option>
+              <option selected>MIS</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="divider"></div>
+        
+        <!-- Exit Management & Trailing Engine Controls -->
+        <h2>Stoploss & Target</h2>
+        <label class="field shortField">
+          <span>SLTP Instrument</span>
+          <select id="sltpInstrument">
+            <option>option</option>
+            <option>spot</option>
+            <option value="strategy">Strategy</option>
+          </select>
+        </label>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>SL Type</span>
+            <select id="slType">
+              <option>percentage</option>
+              <option selected>points</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Target Type</span>
+            <select id="targetType">
+              <option>percentage</option>
+              <option selected>points</option>
+            </select>
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Stoploss Value</span>
+            <input id="stoplossValue" type="number" value="20" />
+          </label>
+          <label class="field">
+            <span>Target Value</span>
+            <input id="targetValue" type="number" value="150" />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Trail</span>
+            <select id="trailingStoploss">
+              <option selected>YES</option>
+              <option>NO</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Start Trail Type</span>
+            <select id="trailStartType">
+              <option value="points">Points</option>
+              <option value="percentage">%</option>
+            </select>
+          </label>
+        </div>
+        
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Start Trail After</span>
+            <input id="trailStartValue" type="number" value="0" min="0" step="0.05" />
+          </label>
+          <label class="field">
+            <span>Move By</span>
+            <input id="trailWhenMovesBy" type="number" value="1" step="0.05" />
+          </label>
+          <label class="field">
+            <span>Move SL By</span>
+            <input id="trailMoveSlBy" type="number" value="1" step="0.05" />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Move SL to Cost</span>
+            <select id="moveSlToCost">
+              <option>NO</option>
+              <option selected>YES</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>By Points</span>
+            <input id="moveSlToCostPoints" type="number" value="10" min="0" step="0.05" />
+          </label>
+        </div>
+
+        <div class="divider"></div>
+        
+        <!-- Broker Order Execution Modes -->
+        <h2>Order Management</h2>
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Entry Mode</span>
+            <select id="entryOrderMode">
+              <option selected>Aggressive_Entry</option>
+              <option>True_Limit_LTP</option>
+              <option>Limit_Below</option>
+              <option>Limit_Above</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Entry Limit Price</span>
+            <input id="entryLimitPrice" type="number" step="0.05" placeholder="blank" disabled />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Exit Mode</span>
+            <select id="exitOrderMode">
+              <option>False</option>
+              <option selected>Aggressive_Exit</option>
+              <option>True_Limit_LTP</option>
+              <option>Limit_Below</option>
+              <option>Limit_Above</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Exit Limit Price</span>
+            <input id="exitLimitPrice" type="number" step="0.05" placeholder="blank" disabled />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Price Chasing</span>
+            <select id="enablePriceChasing">
+              <option selected>NO</option>
+              <option>YES</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>Slippage Tolerance %</span>
+            <input id="chaseSlippagePct" type="number" value="2.0" step="0.1" min="0" />
+          </label>
+        </div>
+        
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Max Retries</span>
+            <input id="chaseMaxRetries" type="number" value="5" min="1" />
+          </label>
+          <label class="field">
+            <span>Timeout (sec)</span>
+            <input id="chaseTimeoutSeconds" type="number" value="20" min="1" />
+          </label>
+          <label class="field">
+            <span>Sweep at Timeout</span>
+            <select id="chaseSweepMarket">
+              <option selected>YES</option>
+              <option>NO</option>
+            </select>
+          </label>
+        </div>
+        
+        <p class="note" id="modeNote">Candles are fetched from Zebu. Paper mode is default; live order placement uses the same order-management rules without sending broker orders.</p>
+
+        <div class="divider"></div>
+        
+        <!-- Pine Strategy Indicator Configurations -->
+        <h2>Chart Settings</h2>
+        <div class="grid3 tight">
+          <label class="field">
+            <span>Use ADX</span>
+            <select id="useAdxFilter">
+              <option selected>YES</option>
+              <option>NO</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>ADX Length</span>
+            <input id="adxLength" type="number" value="14" min="1" />
+          </label>
+          <label class="field">
+            <span>ADX Threshold</span>
+            <input id="adxThreshold" type="number" value="15" min="1" />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Entry Lookback</span>
+            <input id="entryLookback" type="number" value="3" min="1" />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Raghu Length</span>
+            <input id="ssLength" type="number" value="10" min="1" />
+          </label>
+          <label class="field">
+            <span>Base Target Adj</span>
+            <input id="ssTarget" type="number" value="-1" />
+          </label>
+        </div>
+        
+        <div class="grid3 tight">
+          <label class="field">
+            <span>T1 Mult</span>
+            <input id="ssTarget1Mult" type="number" value="4" min="1" />
+          </label>
+          <label class="field">
+            <span>T2 Mult</span>
+            <input id="ssTarget2Mult" type="number" value="8" min="1" />
+          </label>
+          <label class="field">
+            <span>T3 Mult</span>
+            <input id="ssTarget3Mult" type="number" value="12" min="1" />
+          </label>
+        </div>
+        
+        <div class="grid2 tight">
+          <label class="field">
+            <span>Supertrend ATR</span>
+            <input id="stAtrLen" type="number" value="10" min="1" />
+          </label>
+          <label class="field">
+            <span>Supertrend Factor</span>
+            <input id="stFactor" type="number" value="3" min="0.1" step="0.1" />
+          </label>
+        </div>
+      </section>
+
+      <!--
+      ==========================================================================
+      === SECTION 3: CORE CONTENT & METRICS WRAPPER ===
+      === Action consoles, metrics overview, charting interface, order logs, and signals.
+      ==========================================================================
+      -->
+      <div class="content">
+        
+        <!-- Summary block and action controller console -->
+        <section class="panel summary">
+          <div class="summaryHeader">
+            <h2>Summary</h2>
+            <div class="summaryActions">
+              <button id="startRunner" class="miniAction" type="button">Start Paper Algo</button>
+              <button id="stopRunner" class="miniAction secondary" type="button">Stop</button>
+              <button id="checkConnection" class="miniAction success" type="button">Login</button>
+              <button id="runZebu" class="miniAction" type="button">Fetch Once</button>
+            </div>
+          </div>
+          <div id="summaryGrid" class="metrics"></div>
+        </section>
+
+        <!-- Technical candle chart rendering target -->
+        <section class="panel chart">
+          <h2>Recent Candles</h2>
+          <canvas id="chart" width="1200" height="420"></canvas>
+        </section>
+
+        <!-- Live Option Order tracking ledger -->
+        <section class="panel tablePanel">
+          <div class="panelHeader">
+            <h2 id="ordersHeading">Paper Orders</h2>
+            <div class="ordersTools">
+              <div id="dayPnlBadge" class="dayPnlBadge" title="Algo System MTM">Algo MTM: 0.00</div>
+              <div id="brokerPnlBadge" class="dayPnlBadge" title="Total Broker MTM">Broker MTM: 0.00</div>
+              <button id="exitOpenOrder" class="danger compact" type="button">Exit</button>
+            </div>
+          </div>
+          <div id="activeOrderAdjustRow" class="activeOrderAdjustRow">
+            <div class="adjustLabelRow">
+              <div class="adjustLabel">Active Trade: <strong id="activeTradeLabel">-</strong></div>
+              <button id="submitAdjust" class="compact success" type="button">Apply Trade Adjustments</button>
+            </div>
+            <div class="adjustFieldsGrid">
+              <!-- Section 1: Primary Limits -->
+              <div class="adjustGroup">
+                <span class="adjustGroupTitle">Primary Limits</span>
+                <div class="adjustInputsRow">
+                  <label><span>Stoploss:</span> <input id="adjustSL" type="number" step="0.05" /></label>
+                  <label><span>Target:</span> <input id="adjustTarget" type="number" step="0.05" /></label>
+                </div>
+              </div>
+              
+              <!-- Section 2: Trailing Stop -->
+              <div class="adjustGroup">
+                <span class="adjustGroupTitle">Trailing Stop</span>
+                <div class="adjustInputsRow">
+                  <label>
+                    <span>Trail:</span>
+                    <select id="adjustTrail">
+                      <option value="NO">NO</option>
+                      <option value="YES">YES</option>
+                    </select>
+                  </label>
+                  <label><span>Start after:</span> <input id="adjustTrailStart" type="number" step="0.05" /></label>
+                  <label><span>Moves by:</span> <input id="adjustTrailWhen" type="number" step="0.05" /></label>
+                </div>
+              </div>
+              
+              <!-- Section 3: SL to Cost -->
+              <div class="adjustGroup">
+                <span class="adjustGroupTitle">SL to Cost</span>
+                <div class="adjustInputsRow">
+                  <label style="display: inline-flex; align-items: center; gap: 5px; height: 34px;">
+                    <span>To Cost:</span>
+                    <input id="adjustMoveToCost" type="checkbox" style="width: auto; height: auto;" />
+                  </label>
+                </div>
+              </div>
+
+              <!-- Section 4: Manual Trade -->
+              <div class="adjustGroup">
+                <span class="adjustGroupTitle">Manual Trade</span>
+                <div class="adjustInputsRow manualTradeRow">
+                  <button id="manualBuyBtn" class="buyBtn" type="button">Buy</button>
+                  <div class="qtyBlock">
+                    <span>Qty</span>
+                    <div class="qtySpinner">
+                      <button id="qtyDecBtn" class="spinBtn" type="button">-</button>
+                      <div class="qtyInputWrapper">
+                        <input id="adjustQty" type="number" value="50" min="1" />
+                        <span id="adjustQtyLots" class="lotsSubtext">1 lot</span>
+                      </div>
+                      <button id="qtyIncBtn" class="spinBtn" type="button">+</button>
+                    </div>
+                  </div>
+                  <div class="priceBlock">
+                    <span>Price</span>
+                    <input id="adjustPrice" type="text" value="At Mkt" />
+                  </div>
+                  <button id="manualSellBtn" class="sellBtn" type="button">Sell</button>
+                </div>
+                <!-- Pending Manual Limit Status Block -->
+                <div id="pendingManualBlock" class="pendingManualBlock" style="display: none;">
+                  <span id="pendingManualStatus" class="pendingManualStatus">-</span>
+                  <button id="cancelPendingManualBtn" class="cancelPendingManualBtn" type="button">Cancel</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Scrip</th>
+                  <th>Order</th>
+                  <th>Option</th>
+                  <th>Contract</th>
+                  <th>Qty</th>
+                  <th>Entry</th>
+                  <th>LTP</th>
+                  <th>Exit</th>
+                  <th>Initial SL</th>
+                  <th>Current SL</th>
+                  <th>Target</th>
+                  <th>Status</th>
+                  <th>Entry ID</th>
+                  <th>Entry Remarks</th>
+                  <th>Exit ID</th>
+                  <th>Exit Remarks</th>
+                  <th>P&L</th>
+                </tr>
+              </thead>
+              <tbody id="ordersBody"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <!-- Dynamic strategy signal log -->
+        <section class="panel tablePanel">
+          <div class="panelHeader">
+            <h2>Signals</h2>
+            <div id="runningSignalBadge" class="runningSignalBadge" style="display: none;"></div>
+          </div>
+          <div class="tableWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Time</th>
+                  <th>Side</th>
+                  <th>Option</th>
+                  <th>Entry</th>
+                  <th>SL</th>
+                  <th>TP1</th>
+                  <th>TP2</th>
+                  <th>TP3</th>
+                  <th>TSL</th>
+                  <th>Status</th>
+                  <th>P&L</th>
+                </tr>
+              </thead>
+              <tbody id="signalsBody"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+
+    </main>
+
+    <!-- Master Frontend Behavior Application Logic Bundle -->
+    <script src="/static/app.js?v=39"></script>
+  </body>
+</html>

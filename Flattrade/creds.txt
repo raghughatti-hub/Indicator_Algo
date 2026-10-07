@@ -1,0 +1,6 @@
+Vendor code:	FZ31110
+Password:	Manju@312
+TOTP :		PM263N53PU4765472TH7BFZHX464J745
+API key : 	fce3c4a6bbff4458b5417d882ea59798
+API Secret:	2026.62d759e547f045afb0de2a2679d947dfa894eb2b7324000c
+redirectURL:	http://127.0.0.1:8095/flattrade/callback
